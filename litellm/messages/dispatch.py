@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator, Mapping
 from types import MappingProxyType
@@ -27,6 +28,9 @@ from litellm.rust_bridge.public_call import (
 )
 from litellm.types.llms.anthropic_messages.anthropic_response import AnthropicMessagesResponse
 from litellm.types.router import GenericLiteLLMParams
+from litellm.utils import (
+    _get_wrapper_timeout,  # pyright: ignore[reportPrivateUsage]  # the @client wrapper's own failure stamp
+)
 
 __all__ = ("anthropic_messages", "anthropic_messages_handler")
 
@@ -200,6 +204,24 @@ def anthropic_messages_handler(
     )
 
 
+async def _native_amessages(
+    hook: Callable[[NativeCall], Awaitable[MessagesResult]],
+    call: NativeCall,
+    args: tuple[object, ...],
+    kwargs: Mapping[str, object],
+) -> MessagesResult:
+    # Python's handler leaves the event loop (run_in_executor) before it builds the provider body, so
+    # tasks scheduled next to the call, such as the proxy's during_call guardrails, edit the request first
+    await asyncio.sleep(0)
+    try:
+        return await native_call_hook(hook, call, args, kwargs)
+    except Exception as error:
+        if kwargs.get("num_retries") is not None:
+            setattr(error, "num_retries", kwargs.get("num_retries"))  # noqa: B010  # Exception declares no such attribute, as in utils.client
+        setattr(error, "timeout", _get_wrapper_timeout(kwargs=dict(kwargs)))  # noqa: B010  # Exception declares no such attribute, as in utils.client
+        raise
+
+
 async def anthropic_messages(*args: object, **kwargs: object) -> MessagesResult:  # kwargs-ok: public call shape
     python: Final = _PYTHON_AMESSAGES
     return await _ADISPATCH.arun(
@@ -207,7 +229,7 @@ async def anthropic_messages(*args: object, **kwargs: object) -> MessagesResult:
         _FLAG.dropped(kwargs),
         python=python,
         binding=NATIVE_AMESSAGES,
-        native=native_call_hook,
+        native=_native_amessages,
     )
 
 
