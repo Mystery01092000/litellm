@@ -163,6 +163,26 @@ async fn a_200_returns_the_body_and_its_etags(
 }
 
 #[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fetch_runs_as_a_task_on_a_multi_thread_runtime() {
+    let upstream = Upstream::serve(vec![Answer::Raw(OK)]);
+    let target = target(&upstream.url());
+    let fetched = tokio::spawn(async move {
+        fetch(
+            &Client::for_test(),
+            &NoCredentials,
+            &target,
+            POLICY,
+            Start::Fresh,
+        )
+        .await
+    })
+    .await
+    .unwrap();
+    assert!(fetched.is_ok());
+}
+
+#[rstest]
 #[tokio::test]
 async fn a_redirect_is_not_followed_and_its_body_is_the_document() {
     let upstream = Upstream::serve(vec![

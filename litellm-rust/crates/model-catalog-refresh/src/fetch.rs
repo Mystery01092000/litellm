@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use backon::Retryable;
@@ -55,16 +55,16 @@ pub async fn fetch(
     let source =
         Source::parse(&target.url).map_err(|error| Failed::of(&url, &Rejected::fatal(error), 1))?;
     let mut backoff = policy.backoff();
-    let made = Cell::new(0);
+    let made = AtomicU32::new(0);
     if let Start::After(failed) = start {
         let Some(wait) = backoff.next() else {
             return Err(failed);
         };
         tokio::time::sleep(policy.delay(wait, failed.retry_after)).await;
-        made.set(1);
+        made.store(1, Ordering::Relaxed);
     }
     let attempt = || {
-        made.set(made.get() + 1);
+        made.fetch_add(1, Ordering::Relaxed);
         async {
             match &source {
                 Source::Http(http) => attempt::http(client, http.clone(), policy.timeout).await,
@@ -82,14 +82,14 @@ pub async fn fetch(
         .notify(|rejected, wait| {
             litellm_tracing::warn!(
                 "LiteLLM: model cost map fetch attempt {}/{} failed ({}); retrying in {:.1}s",
-                made.get(),
+                made.load(Ordering::Relaxed),
                 policy.max_attempts,
                 reason(&url, &rejected.cause),
                 wait.as_secs_f64(),
             );
         })
         .await
-        .map_err(|rejected| Failed::of(&url, &rejected, made.get()))
+        .map_err(|rejected| Failed::of(&url, &rejected, made.load(Ordering::Relaxed)))
 }
 
 impl Failed {
