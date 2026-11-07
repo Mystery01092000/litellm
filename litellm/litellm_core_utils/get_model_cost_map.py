@@ -231,9 +231,9 @@ def _loaded(installed: NativeInstalled) -> dict:
 
 
 def _install(installed: NativeInstalled) -> int:
-    """Publishes an installed table as ``litellm.model_cost``. It already carries every ``register_model`` call, and
-    the router rows and the registrations are written again after, so registrations still win the fields they share
-    with router rows, as on main."""
+    """Publishes an installed document as ``litellm.model_cost``, then writes the router rows and every kept
+    ``register_model`` call onto it in that order, as on main. Registrations are written after publishing because
+    where each one lands is a lookup in the published table."""
     import litellm
     from litellm import utils
 
@@ -245,7 +245,7 @@ def _install(installed: NativeInstalled) -> int:
 
 
 def install_model_cost_map(body: bytes, etag: str | None = None) -> ModelCostMapReloadResult:
-    """Installs a cost map document as ``litellm.model_cost``, every kept ``register_model`` call applied on top."""
+    """Installs a cost map document as ``litellm.model_cost``, every kept ``register_model`` call written on top."""
     installed: Final = model_cost_inputs.install(body, etag)
     if isinstance(installed, NativeRejected):
         return ModelCostMapReloadUnavailable(reason=installed.reason)

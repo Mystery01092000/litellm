@@ -46,7 +46,7 @@ Every price in a row lowers to one `Price { meter, channel, when }` and its `Uni
 
 `store/` is the catalog's in-memory store and the only place that indexes model names. Its rules are in [src/store/AGENTS.md](src/store/AGENTS.md)
 
-`cost_map.rs` holds a host's inputs, the installed document and the `register_model` overlay in `register.rs`, and materializes them in the key order and alias sharing Python's `litellm.model_cost` has. It never holds the live table, which belongs to the host
+`cost_map.rs` holds a host's inputs, the installed document and the `register_model` overlay in `register.rs`. It serves the document in the key order and alias sharing Python's `litellm.model_cost` has, without the overlay, since where a registration lands is a lookup in the published table. It never holds the live table, which belongs to the host
 
 `resolve/` and `model_info.rs` hold types only. The functions over them land with their first caller
 

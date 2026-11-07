@@ -96,7 +96,8 @@ fn loaded_serves_python_key_order_without_fallback_rules_or_alias_lists() {
 fn a_rejected_document_changes_nothing(#[case] limits: IntegrityLimits, #[case] kind: ErrorKind) {
     let mut cost_map = installed(&json!({"kept": {"litellm_provider": "p"}}));
     cost_map.register("registered", &fields(json!({"x": 1})));
-    let before = served(&cost_map.materialize());
+    let before = served(&cost_map.loaded());
+    let registered = cost_map.registrations().clone();
     let provenance = cost_map.provenance().clone();
 
     let error = cost_map
@@ -108,7 +109,8 @@ fn a_rejected_document_changes_nothing(#[case] limits: IntegrityLimits, #[case] 
         .unwrap_err();
 
     assert_eq!(error.kind(), kind);
-    assert_eq!(served(&cost_map.materialize()), before);
+    assert_eq!(served(&cost_map.loaded()), before);
+    assert_eq!(cost_map.registrations(), &registered);
     assert_eq!(cost_map.provenance(), &provenance);
 }
 
@@ -162,15 +164,22 @@ fn registrations_survive_an_accept_above_the_new_document() {
         )
         .unwrap();
 
-    let rows = cost_map.materialize();
-    let row = model(&rows, "m");
     assert_eq!(
-        Value::Object(row.fields.clone().into_owned()),
+        Value::Object(cost_map.registered_row("m").unwrap().into_owned()),
         json!({"litellm_provider": "p", "price": 5, "new": true})
     );
+}
+
+#[rstest]
+fn the_installed_table_is_the_document_without_registrations() {
+    let mut cost_map = installed(&json!({"m": {"litellm_provider": "p", "price": 1}}));
+    cost_map.register("m", &fields(json!({"price": 5})));
+    cost_map.register("only-registered", &fields(json!({"price": 7})));
+    cost_map.landed("m", "m");
+    cost_map.landed("only-registered", "only-registered");
     assert_eq!(
-        row.registered_fields.iter().copied().collect::<Vec<_>>(),
-        ["price"]
+        served(&cost_map.loaded()),
+        vec![("m".to_owned(), json!({"litellm_provider": "p", "price": 1}))]
     );
 }
 
@@ -194,13 +203,9 @@ fn a_registration_for_a_key_the_document_later_adds_still_wins() {
         &fields(json!({"litellm_provider": "mine", "price": 9})),
     );
     cost_map.landed("custom", "custom");
-    let before = served(&cost_map.materialize());
     assert_eq!(
-        before.last(),
-        Some(&(
-            "custom".to_owned(),
-            json!({"litellm_provider": "mine", "price": 9})
-        ))
+        Value::Object(cost_map.registered_row("custom").unwrap().into_owned()),
+        json!({"litellm_provider": "mine", "price": 9})
     );
 
     cost_map
@@ -212,47 +217,8 @@ fn a_registration_for_a_key_the_document_later_adds_still_wins() {
         .unwrap();
 
     assert_eq!(
-        served(&cost_map.materialize()),
-        vec![(
-            "custom".to_owned(),
-            json!({"litellm_provider": "mine", "price": 9, "other": 2})
-        )]
-    );
-}
-
-#[rstest]
-fn a_registration_landed_on_an_alias_applies_to_the_whole_group() {
-    let mut cost_map =
-        installed(&json!({"owner": {"litellm_provider": "p", "aliases": ["short"], "price": 1}}));
-    cost_map.register("p/short", &fields(json!({"price": 3})));
-    cost_map.landed("short", "p/short");
-    let rows = cost_map.materialize();
-    assert_eq!(
-        served(&rows),
-        vec![
-            (
-                "owner".to_owned(),
-                json!({"litellm_provider": "p", "price": 3})
-            ),
-            (
-                "short".to_owned(),
-                json!({"alias_of": "owner", "row": {"litellm_provider": "p", "price": 3}})
-            ),
-        ]
-    );
-    assert_eq!(
-        model(&rows, "owner")
-            .registered_fields
-            .iter()
-            .copied()
-            .collect::<Vec<_>>(),
-        ["price"]
-    );
-    assert!(
-        cost_map
-            .materialize()
-            .iter()
-            .all(|row| row.key != "p/short")
+        Value::Object(cost_map.registered_row("custom").unwrap().into_owned()),
+        json!({"litellm_provider": "mine", "price": 9, "other": 2})
     );
 }
 
@@ -286,7 +252,7 @@ fn document_and_registrations() -> impl Strategy<Value = (BTreeMap<String, i64>,
 proptest! {
     /// Keys are the union of document and registrations, and each row is the latest registration over the document
     #[test]
-    fn materialize_serves_the_overlay_over_the_base((document, registrations) in document_and_registrations()) {
+    fn registered_rows_are_the_overlay_over_the_base((document, registrations) in document_and_registrations()) {
         let body: Map<String, Value> = document
             .iter()
             .map(|(key, price)| (key.clone(), json!({"litellm_provider": "p", "price": price})))
@@ -298,20 +264,17 @@ proptest! {
         }
 
         let latest: BTreeMap<&str, i64> = registrations.iter().map(|(key, price)| (key.as_str(), *price)).collect();
-        let rows = cost_map.materialize();
-        let served: BTreeMap<&str, Option<i64>> = rows
+        let keys = cost_map.registered_keys();
+        let served: BTreeMap<&str, Option<i64>> = keys
             .iter()
-            .map(|row| match &row.shape {
-                RowShape::Model(model) => (row.key, model.fields.get("price").and_then(Value::as_i64)),
-                shape => panic!("unexpected {shape:?}"),
-            })
+            .map(|key| (*key, cost_map.registered_row(key).and_then(|row| row.get("price").and_then(Value::as_i64))))
             .collect();
         let expected: BTreeMap<&str, Option<i64>> = document
             .iter()
             .map(|(key, price)| (key.as_str(), Some(latest.get(key.as_str()).copied().unwrap_or(*price))))
             .chain(latest.iter().filter(|(key, _)| !document.contains_key(**key)).map(|(key, price)| (*key, Some(*price))))
             .collect();
-        prop_assert_eq!(rows.len(), served.len());
+        prop_assert_eq!(keys.len(), served.len());
         prop_assert_eq!(served, expected);
     }
 }

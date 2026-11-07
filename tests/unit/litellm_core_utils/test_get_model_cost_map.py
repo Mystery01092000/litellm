@@ -44,7 +44,7 @@ from litellm.litellm_core_utils.get_model_cost_map import (
     model_cost_inputs,
     refetch_model_cost_map,
 )
-from litellm.rust_bridge._native import NativeInstalled, NativeModelCostMap
+from litellm.rust_bridge._native import NativeInstalled, NativeModelCostMap, NativeRegistered
 from litellm.utils import catalog_with_runtime_registrations, get_model_cost_key, runtime_model_cost_registrations
 from tests.test_litellm_rust.support.child_interpreter import run_child_interpreter
 
@@ -858,15 +858,16 @@ def test_alias_of_rows_are_served_as_their_target_and_dangling_ones_are_dropped(
     assert rows["twin-latest"] is rows["other"]
 
 
-def test_an_instance_writes_only_the_dict_it_is_handed():
+def test_an_instance_writes_only_the_published_dict_it_is_handed(monkeypatch: pytest.MonkeyPatch):
     instance, rows = _own_instance({"lit-own": {"litellm_provider": "openai", "mode": "chat"}})
-    live: Final = dict(litellm.model_cost)
+    previous: Final = litellm.model_cost
+    monkeypatch.setattr(litellm, "model_cost", rows)
 
     written: Final = instance.register(rows, {"lit-own-new": {"litellm_provider": "openai"}}, True)
 
-    assert written == ["lit-own-new"]
+    assert isinstance(written, NativeRegistered)
     assert "lit-own-new" in rows
-    assert litellm.model_cost == live
+    assert "lit-own-new" not in previous
     assert instance.find_key(rows, "LIT-OWN-NEW") == "lit-own-new"
 
 

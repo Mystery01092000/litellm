@@ -36,7 +36,8 @@ pub(crate) struct NativeModelCostMap {
     module = "litellm.rust_bridge._native"
 )]
 pub(crate) struct NativeInstalled {
-    /// The new live table, the document with every registration applied
+    /// The new live table, the document without registrations. `reapply` writes them once Python publishes it, since
+    /// where each one lands is a lookup in the published table
     #[pyo3(get)]
     rows: Py<PyDict>,
     /// How many keys the document itself serves, aliases included and registrations left out
@@ -59,6 +60,25 @@ pub(crate) struct NativeRejected {
     #[pyo3(get)]
     integrity: bool,
 }
+
+/// A finished registration pass, with the registrations no built-in row matched, by registered key
+#[pyclass(
+    frozen,
+    name = "NativeRegistered",
+    module = "litellm.rust_bridge._native"
+)]
+pub(crate) struct NativeRegistered {
+    #[pyo3(get)]
+    unmatched: Py<PyDict>,
+}
+
+/// A registration pass that stopped because the table it was handed is no longer the host's published one
+#[pyclass(
+    frozen,
+    name = "NativeTableSwapped",
+    module = "litellm.rust_bridge._native"
+)]
+pub(crate) struct NativeTableSwapped;
 
 /// The inputs at one moment, for a caller that has to put them back, such as test isolation
 #[pyclass(
@@ -116,8 +136,8 @@ impl NativeModelCostMap {
         fetch::fetch_blocking(py, &source, &policy, resume_from.as_deref())
     }
 
-    /// Accepts a fetched document and returns the live table built from it with every registration applied, or why
-    /// it was rejected, in which case nothing changed
+    /// Accepts a fetched document and returns the live table built from it, or why it was rejected, in which case
+    /// nothing changed
     #[pyo3(signature = (body, etag = None))]
     fn install(&self, py: Python<'_>, body: &[u8], etag: Option<String>) -> PyResult<Py<PyAny>> {
         let accepted = {
@@ -148,49 +168,45 @@ impl NativeModelCostMap {
         self.installed(py, &inputs)
     }
 
-    /// Writes each entry into `rows` as main's `register_model` does and returns the row keys they landed on. With
-    /// `persist`, the entries are also kept and written again over every later install
-    #[pyo3(signature = (rows, entries, persist, custom_llm_provider = None, warning_display_name = None))]
+    /// Writes each entry into `rows` as main's `register_model` does. With `persist`, the entries are also kept and
+    /// written again over every later install, unless writing them raised. Reports a swapped table when `rows` stopped
+    /// being the host's published table partway through, so the caller writes them again into the new one
+    #[pyo3(signature = (rows, entries, persist, custom_llm_provider = None))]
     fn register(
         &self,
         rows: &Bound<'_, PyDict>,
         entries: &Bound<'_, PyDict>,
         persist: bool,
         custom_llm_provider: Option<&str>,
-        warning_display_name: Option<&str>,
-    ) -> PyResult<Vec<String>> {
+    ) -> PyResult<Py<PyAny>> {
         let entries: Vec<(String, Bound<'_, PyAny>)> = entries
             .iter()
             .map(|(key, value)| Ok((key.str()?.to_string(), value)))
             .collect::<PyResult<_>>()?;
-        if persist {
-            let parsed = entries
-                .iter()
-                .map(|(key, value)| Ok((key, from_py::<Fields>(value)?)))
-                .collect::<PyResult<Vec<_>>>()?;
-            let mut inputs = self.write_inputs();
-            for (key, fields) in parsed {
-                inputs.register(key, &fields);
-            }
-        }
-        entries
-            .iter()
-            .map(|(key, value)| {
-                self.write(
-                    rows,
-                    key,
-                    value,
-                    persist,
-                    custom_llm_provider,
-                    warning_display_name,
-                )
+        let kept = persist
+            .then(|| {
+                entries
+                    .iter()
+                    .map(|(key, value)| Ok((key.as_str(), from_py::<Fields>(value)?)))
+                    .collect::<PyResult<Vec<_>>>()
             })
-            .collect()
+            .transpose()?;
+        let pass = self.write_pass(rows, &entries, custom_llm_provider)?;
+        if let Some(kept) = kept {
+            {
+                let mut inputs = self.write_inputs();
+                for (key, fields) in &kept {
+                    inputs.register(key, fields);
+                }
+            }
+            self.record_landings(&pass.landed);
+        }
+        pass.into_py(rows.py())
     }
 
     /// Writes every kept registration into `rows` again, oldest first, so it wins the fields it shares with rows the
     /// router replayed after an install
-    fn reapply(&self, rows: &Bound<'_, PyDict>) -> PyResult<()> {
+    fn reapply(&self, rows: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
         let py = rows.py();
         let registrations: Vec<(String, Fields)> = self
             .read_inputs()
@@ -198,17 +214,13 @@ impl NativeModelCostMap {
             .entries()
             .map(|(key, fields)| (key.to_owned(), fields.clone()))
             .collect();
-        for (key, fields) in registrations {
-            self.write(
-                rows,
-                &key,
-                &to_py(py, &fields)?.into_bound(py),
-                true,
-                None,
-                None,
-            )?;
-        }
-        Ok(())
+        let entries = registrations
+            .iter()
+            .map(|(key, fields)| Ok((key.clone(), to_py(py, fields)?.into_bound(py))))
+            .collect::<PyResult<Vec<_>>>()?;
+        let pass = self.write_pass(rows, &entries, None)?;
+        self.record_landings(&pass.landed);
+        pass.into_py(py)
     }
 
     /// The installed row under `key` with the kept registrations that apply to it, without anything the router wrote
@@ -280,7 +292,7 @@ impl NativeModelCostMap {
     }
 
     fn installed(&self, py: Python<'_>, inputs: &CostMap) -> PyResult<Py<PyAny>> {
-        let rows = rows::table(py, &inputs.materialize())?;
+        let rows = rows::table(py, &inputs.loaded())?;
         let model_count = inputs.loaded().len();
         let fallback_generalizations = match inputs.fallback_generalizations() {
             Some(block) => to_py(py, block)?,
@@ -299,22 +311,45 @@ impl NativeModelCostMap {
         .map(Py::into_any)
     }
 
-    /// One registration through the host's write, with no lock held so the write may look names up through this map
-    fn write(
+    /// Writes `entries` into `rows` in order, each one landing where the host resolves it, so every lookup sees the
+    /// writes before it. No lock is held while the host runs, since its lookup reaches `find_key` on this map. Stops at
+    /// the first entry the host cannot resolve because `rows` is no longer its published table
+    fn write_pass<'py>(
         &self,
-        rows: &Bound<'_, PyDict>,
-        key: &str,
-        value: &Bound<'_, PyAny>,
-        persist: bool,
+        rows: &Bound<'py, PyDict>,
+        entries: &[(String, Bound<'py, PyAny>)],
         custom_llm_provider: Option<&str>,
-        warning_display_name: Option<&str>,
-    ) -> PyResult<String> {
-        let written = rows::write(rows, key, value, custom_llm_provider, warning_display_name)?;
-        if persist {
-            self.write_inputs().landed(&written, key);
+    ) -> PyResult<Pass<'py>> {
+        let mut landed = Vec::new();
+        let mut unmatched = Vec::new();
+        for (key, registration) in entries {
+            let Some(landing) = rows::resolve(rows, key, registration, custom_llm_provider)? else {
+                return Ok(Pass {
+                    landed,
+                    unmatched,
+                    swapped: true,
+                });
+            };
+            rows::write(rows, &landing, registration)?;
+            self.invalidate();
+            rows::changed(rows.py())?;
+            if !landing.matched_builtin {
+                unmatched.push((key.clone(), registration.clone()));
+            }
+            landed.push((key.clone(), landing.key));
         }
-        self.invalidate();
-        Ok(written)
+        Ok(Pass {
+            landed,
+            unmatched,
+            swapped: false,
+        })
+    }
+
+    fn record_landings(&self, landed: &[(String, String)]) {
+        let mut inputs = self.write_inputs();
+        for (registered, written) in landed {
+            inputs.landed(written, registered);
+        }
     }
 
     /// Queries the index over `rows`, rebinding it when `rows` is not the dict it was built over
@@ -335,5 +370,114 @@ impl NativeModelCostMap {
             store
         });
         query(&store)
+    }
+}
+
+/// What one pass over a host's table did: the row each registration landed on, the registrations no built-in row
+/// matched, and whether the pass stopped because the table was swapped
+struct Pass<'py> {
+    landed: Vec<(String, String)>,
+    unmatched: Vec<(String, Bound<'py, PyAny>)>,
+    swapped: bool,
+}
+
+impl Pass<'_> {
+    fn into_py(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if self.swapped {
+            return Py::new(py, NativeTableSwapped).map(Py::into_any);
+        }
+        let unmatched = PyDict::new(py);
+        for (key, registration) in &self.unmatched {
+            unmatched.set_item(key, registration)?;
+        }
+        Py::new(
+            py,
+            NativeRegistered {
+                unmatched: unmatched.unbind(),
+            },
+        )
+        .map(Py::into_any)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use pyo3::ffi::c_str;
+    use rstest::rstest;
+
+    use super::*;
+
+    const HOST: &std::ffi::CStr = c_str!(
+        r#"
+from types import SimpleNamespace
+
+class Row(dict):
+    names = ()
+
+found = []
+
+def resolve(rows, key, registration, custom_llm_provider):
+    found.append(cost_map.find_key(rows, key))
+    return SimpleNamespace(key=key, base={}, matched_builtin=True)
+
+def merged(current, base, registration):
+    return Row({**(current or {}), **base, **registration})
+
+def changed():
+    pass
+"#
+    );
+
+    #[rstest]
+    fn a_host_lookup_that_reaches_find_key_on_the_same_map_finishes() {
+        Python::initialize();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = Python::attach(|py| -> PyResult<(Vec<Option<String>>, f64)> {
+                let cost_map = Py::new(py, NativeModelCostMap::bundled(0, 0.0)?)?;
+                let module_name = std::ffi::CString::new(rows::MODULE).unwrap();
+                let host =
+                    PyModule::from_code(py, HOST, c_str!("host_model_cost.py"), &module_name)?;
+                host.setattr("cost_map", &cost_map)?;
+                let modules = py.import("sys")?.getattr("modules")?;
+                let packages = ["litellm", "litellm.rust_bridge", "litellm.rust_bridge.host"];
+                for package in packages {
+                    modules.set_item(package, PyModule::new(py, package)?)?;
+                }
+                modules.set_item(rows::MODULE, &host)?;
+                let rows = PyDict::new(py);
+                rows.set_item("Lit-Reentry", PyDict::new(py))?;
+                let entry = PyDict::new(py);
+                entry.set_item("input_cost_per_token", 1.5)?;
+                let entries = PyDict::new(py);
+                entries.set_item("lit-reentry", entry)?;
+                let registered = cost_map
+                    .bind(py)
+                    .call_method1("register", (&rows, &entries, false));
+                for name in [rows::MODULE].into_iter().chain(packages) {
+                    modules.del_item(name)?;
+                }
+                registered?;
+                let price = rows
+                    .get_item("lit-reentry")?
+                    .expect("the registration landed")
+                    .get_item("input_cost_per_token")?
+                    .extract()?;
+                Ok((host.getattr("found")?.extract()?, price))
+            });
+            sender
+                .send(outcome.map_err(|error| error.to_string()))
+                .unwrap();
+        });
+
+        let (found, price) = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("register finished instead of deadlocking on its own lock")
+            .unwrap();
+        assert_eq!(found, [Some("Lit-Reentry".to_owned())]);
+        assert!((price - 1.5).abs() < f64::EPSILON);
     }
 }

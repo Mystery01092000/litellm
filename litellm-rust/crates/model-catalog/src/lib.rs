@@ -18,7 +18,8 @@
 //! - `FallbackGeneralizations` / `FallbackRule`: regex rules that map unknown model ids onto known
 //!   families. They are data in the file, not entries.
 //! - `CostMap`: the inputs a host builds its live table from, the installed document plus the ordered
-//!   `register_model` overlay, materialized as the rows Python's `litellm.model_cost` holds.
+//!   `register_model` overlay. The document is served in the key order and alias sharing Python's
+//!   `litellm.model_cost` has, and the host writes the overlay onto it after publishing it.
 //! - Validation: `Catalog::check_size` checks a catalog against `IntegrityLimits` (a remote copy
 //!   that lost most of its models is refused), and `Catalog::row_errors` validates one row.
 //!

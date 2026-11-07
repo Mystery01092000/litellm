@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};
 
 use indexmap::{IndexMap, IndexSet};
@@ -60,8 +59,6 @@ pub struct ModelRow<'a> {
     pub fields: Cow<'a, Fields>,
     /// Every name the row is served under, the owner first. Empty for a row without aliases
     pub names: &'a [String],
-    /// The fields a registration set on this row
-    pub registered_fields: BTreeSet<&'a str>,
 }
 
 impl Base {
@@ -77,10 +74,6 @@ impl Base {
             },
         );
         Self { catalog, groups }
-    }
-
-    fn contains(&self, key: &str) -> bool {
-        self.catalog.get(key).is_some() || self.catalog.section(key).is_some()
     }
 
     /// The installed row as Python serves it, without the `aliases` list its document carried
@@ -184,12 +177,28 @@ impl CostMap {
     /// The installed document as Python serves it: every top-level key but `fallback_generalizations` in document
     /// order, then each owner's aliases
     pub fn loaded(&self) -> Vec<Row<'_>> {
-        self.rows(false)
-    }
-
-    /// `loaded` with every registration applied, then the rows only a registration names
-    pub fn materialize(&self) -> Vec<Row<'_>> {
-        self.rows(true)
+        let documented = self
+            .base
+            .catalog
+            .written()
+            .filter(|(key, _)| *key != FALLBACK_GENERALIZATIONS)
+            .map(|(key, written)| Row {
+                key,
+                shape: match written {
+                    Written::Entry(_) => RowShape::Model(ModelRow {
+                        fields: self.base.row(key).unwrap_or_default(),
+                        names: self.base.names(key),
+                    }),
+                    Written::Section(value) => RowShape::Section(value),
+                },
+            });
+        let aliases = self.base.groups.iter().flat_map(|(owner, names)| {
+            names.iter().skip(1).map(move |alias| Row {
+                key: alias,
+                shape: RowShape::AliasOf(owner),
+            })
+        });
+        documented.chain(aliases).collect()
     }
 
     /// The installed row under `key` with the registrations that apply to it, `None` when neither has one
@@ -215,71 +224,6 @@ impl CostMap {
             .filter(|key| !loaded.contains(key))
             .collect();
         loaded.into_iter().chain(registered).collect()
-    }
-
-    fn rows(&self, with_overlay: bool) -> Vec<Row<'_>> {
-        let documented = self
-            .base
-            .catalog
-            .written()
-            .filter(|(key, _)| *key != FALLBACK_GENERALIZATIONS)
-            .map(|(key, written)| Row {
-                key,
-                shape: match written {
-                    Written::Entry(_) => RowShape::Model(self.model_row(key, with_overlay)),
-                    Written::Section(value) => RowShape::Section(value),
-                },
-            });
-        let aliases = self.base.groups.iter().flat_map(|(owner, names)| {
-            names.iter().skip(1).map(move |alias| Row {
-                key: alias,
-                shape: RowShape::AliasOf(owner),
-            })
-        });
-        let registered_only: IndexSet<&str> = if with_overlay {
-            self.overlay
-                .targets()
-                .filter(|key| !self.base.contains(key))
-                .collect()
-        } else {
-            IndexSet::new()
-        };
-        let registered_only = registered_only.into_iter().map(|key| Row {
-            key,
-            shape: RowShape::Model(self.model_row(key, true)),
-        });
-        documented.chain(aliases).chain(registered_only).collect()
-    }
-
-    fn model_row<'a>(&'a self, key: &'a str, with_overlay: bool) -> ModelRow<'a> {
-        let names = self.base.names(key);
-        let base = self.base.row(key).unwrap_or_default();
-        let registered = if with_overlay {
-            let group: Vec<&str> = match names {
-                [] => vec![key],
-                names => names.iter().map(String::as_str).collect(),
-            };
-            self.overlay.over(&group)
-        } else {
-            Vec::new()
-        };
-        if registered.is_empty() {
-            return ModelRow {
-                fields: base,
-                names,
-                registered_fields: BTreeSet::new(),
-            };
-        }
-        ModelRow {
-            registered_fields: registered
-                .iter()
-                .flat_map(|fields| fields.iter())
-                .filter(|(_, value)| !value.is_null())
-                .map(|(name, _)| name.as_str())
-                .collect(),
-            fields: Cow::Owned(merged(base.into_owned(), &registered)),
-            names,
-        }
     }
 }
 

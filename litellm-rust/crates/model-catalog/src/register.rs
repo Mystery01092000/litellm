@@ -58,17 +58,6 @@ impl Registrations {
         self.entries.contains_key(key)
     }
 
-    /// Row keys a registration was written to, then registered keys never written anywhere
-    pub(crate) fn targets(&self) -> impl Iterator<Item = &str> {
-        let landed = self.landed_on.keys().map(String::as_str);
-        let unlanded = self
-            .entries
-            .keys()
-            .filter(|key| !self.landed_on.values().flatten().any(|name| name == *key))
-            .map(String::as_str);
-        landed.chain(unlanded)
-    }
-
     /// The registrations that apply to the row under any of `names`, oldest first, as `_RegistrationsOverCatalog` reads them
     pub(crate) fn over<'a>(&'a self, names: &[&str]) -> Vec<&'a Fields> {
         let mut applied: Vec<(usize, &Fields)> = names
@@ -210,17 +199,5 @@ mod tests {
             .map(|fields| Value::Object(fields.clone()))
             .collect();
         assert_eq!(applied, vec![json!({"x": 2}), json!({"x": 1, "y": 4})]);
-    }
-
-    #[rstest]
-    fn targets_list_landed_rows_then_unlanded_registrations() {
-        let mut registrations = Registrations::default();
-        registrations.register("openai/o3-pro", &fields(json!({"x": 1})));
-        registrations.register("never-written", &fields(json!({"x": 2})));
-        registrations.landed("o3-pro", "openai/o3-pro");
-        assert_eq!(
-            registrations.targets().collect::<Vec<_>>(),
-            vec!["o3-pro", "never-written"]
-        );
     }
 }

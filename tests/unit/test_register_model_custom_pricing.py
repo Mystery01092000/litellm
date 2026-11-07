@@ -10,10 +10,11 @@ calculations for DB-sourced models with prompt caching pricing.
 """
 
 import copy
+import datetime
 import itertools
 import json
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Final, NoReturn
 
 import pytest
@@ -23,7 +24,9 @@ from litellm.litellm_core_utils.get_model_cost_map import (
     GetModelCostMap,
     ModelCostMapReloaded,
     install_model_cost_map,
+    model_cost_inputs,
 )
+from litellm.rust_bridge._native import NativeTableSwapped
 from litellm.types.utils import (
     Choices,
     CompletionTokensDetailsWrapper,
@@ -33,6 +36,7 @@ from litellm.types.utils import (
     Usage,
 )
 from litellm.utils import model_cost_changed
+from tests.test_litellm_rust.support.child_interpreter import run_child_interpreter
 
 
 def _snapshot_model_cost_entries(keys):
@@ -869,18 +873,18 @@ def test_register_model_keeps_its_price_when_a_reload_adopts_a_map_as_it_writes(
         catalog_key: {**catalog_row, "input_cost_per_token": reloaded_input_cost},
     }
 
-    class CostMapAReloadReplacesAsItIsWritten(dict[str, dict[str, object]]):
-        def update(self, other: Mapping[str, dict[str, object]], /) -> None:  # pyright: ignore[reportIncompatibleMethodOverride]  # registration writes pass one mapping
-            if litellm.model_cost is self:
-                _publish(reloaded_cost_map)
-            super().update(other)
+    written_map: Final = {**builtin_cost_map, catalog_key: dict(catalog_row)}
+    registration_base: Final = litellm.utils._registration_base
+
+    def reload_while_resolving(*args: object, **kwargs: object) -> object:
+        resolved = registration_base(*args, **kwargs)
+        if litellm.model_cost is written_map:
+            _publish(reloaded_cost_map)
+        return resolved
 
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
-    monkeypatch.setattr(
-        litellm,
-        "model_cost",
-        CostMapAReloadReplacesAsItIsWritten({**builtin_cost_map, catalog_key: dict(catalog_row)}),
-    )
+    monkeypatch.setattr(litellm, "model_cost", written_map)
+    monkeypatch.setattr(litellm.utils, "_registration_base", reload_while_resolving)
     model_cost_changed()
 
     litellm.register_model(
@@ -1704,3 +1708,160 @@ def test_direct_call_flat_rate_applies_to_the_callers_own_tiers_not_the_catalogs
     finally:
         litellm.model_cost.pop(model_key, None)
         model_cost_changed()
+
+
+_RELOAD_BASE_KEY: Final = "lit-reload-base-model"
+_RELOAD_NESTED_KEY: Final = "lit-reload-nested-model"
+_RELOAD_DOCUMENT: Final = {
+    **GetModelCostMap.load_local_model_cost_map(),
+    _RELOAD_BASE_KEY: {
+        "litellm_provider": "bedrock",
+        "mode": "chat",
+        "input_cost_per_token": 1e-06,
+        "output_cost_per_token": 2e-06,
+        "cache_read_input_token_cost": 1e-07,
+        "cache_creation_input_token_cost": 3e-06,
+    },
+    _RELOAD_NESTED_KEY: {
+        "litellm_provider": "openai",
+        "mode": "chat",
+        "search_context_cost_per_query": {
+            "search_context_size_low": 0.01,
+            "search_context_size_medium": 0.02,
+            "search_context_size_high": 0.03,
+        },
+    },
+}
+
+
+def _reload_cost_map() -> None:
+    assert isinstance(install_model_cost_map(json.dumps(_RELOAD_DOCUMENT).encode()), ModelCostMapReloaded)
+
+
+def test_a_reload_keeps_what_a_registration_inherited_for_a_key_the_document_lacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(litellm, "model_cost", litellm.model_cost)
+    _reload_cost_map()
+    registered_key: Final = f"bedrock/bedrock/bedrock/{_RELOAD_BASE_KEY}"
+    litellm.register_model(
+        {registered_key: {"input_cost_per_token": 5e-06, "output_cost_per_token": 6e-06, "litellm_provider": "bedrock"}}
+    )
+    registered: Final = dict(litellm.model_cost[registered_key])
+    assert (
+        registered["cache_read_input_token_cost"] == _RELOAD_DOCUMENT[_RELOAD_BASE_KEY]["cache_read_input_token_cost"]
+    )
+
+    _reload_cost_map()
+
+    assert dict(litellm.model_cost[registered_key]) == registered
+
+
+def test_a_reload_keeps_the_document_sub_keys_beside_a_registered_nested_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(litellm, "model_cost", litellm.model_cost)
+    _reload_cost_map()
+    litellm.register_model({_RELOAD_NESTED_KEY: {"search_context_cost_per_query": {"search_context_size_low": 0.5}}})
+    expected: Final = {
+        **_RELOAD_DOCUMENT[_RELOAD_NESTED_KEY]["search_context_cost_per_query"],
+        "search_context_size_low": 0.5,
+    }
+    assert litellm.model_cost[_RELOAD_NESTED_KEY]["search_context_cost_per_query"] == expected
+
+    _reload_cost_map()
+
+    assert litellm.model_cost[_RELOAD_NESTED_KEY]["search_context_cost_per_query"] == expected
+
+
+def test_register_model_leaves_the_native_runtime_unstarted() -> None:
+    script: Final = """
+import litellm
+from litellm.rust_bridge._native import process_state_started
+litellm.register_model({"lit-fork-safe-model": {"input_cost_per_token": 1e-06, "litellm_provider": "openai"}})
+assert litellm.model_cost["lit-fork-safe-model"]["input_cost_per_token"] == 1e-06
+assert not process_state_started()
+"""
+    result: Final = run_child_interpreter(
+        script, env={**os.environ, "LITELLM_LOCAL_MODEL_COST_MAP": "True"}, timeout=120
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_lookup_that_raises_reaches_the_caller_and_keeps_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    error: Final = LookupError("lit-lookup-failed")
+
+    def failing_lookup(*_args: object, **_kwargs: object) -> NoReturn:
+        raise error
+
+    monkeypatch.setattr(litellm.utils, "_registration_base", failing_lookup)
+    registered_before: Final = model_cost_inputs.registered_keys()
+
+    with pytest.raises(LookupError) as raised:
+        litellm.register_model({"lit-raise-model": {"input_cost_per_token": 1e-06, "litellm_provider": "openai"}})
+
+    assert raised.value is error
+    assert model_cost_inputs.registered_keys() == registered_before
+    assert "lit-raise-model" not in litellm.model_cost
+
+
+def test_registering_into_a_table_that_is_not_published_reports_it_and_writes_nothing() -> None:
+    other: Final = {"lit-other-model": {"litellm_provider": "openai"}}
+
+    result: Final = model_cost_inputs.register(other, {"lit-swap-model": {"input_cost_per_token": 1e-06}}, False)
+
+    assert isinstance(result, NativeTableSwapped)
+    assert other == {"lit-other-model": {"litellm_provider": "openai"}}
+
+
+def test_an_entry_landing_on_an_earlier_entry_of_the_same_call_merges_onto_that_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(litellm, "model_cost", dict(litellm.model_cost))
+    key: Final = "lit-chained-model"
+    litellm.register_model(
+        {
+            key: {
+                "litellm_provider": "openai",
+                "mode": "chat",
+                "input_cost_per_token": 1e-06,
+                "output_cost_per_token": 2e-06,
+            }
+        },
+        persist_across_reloads=False,
+    )
+    assert litellm.get_model_info(f"openai/{key}")["max_input_tokens"] is None
+
+    litellm.register_model(
+        {key: {"max_input_tokens": 4096}, f"openai/{key}": {"input_cost_per_token": 5e-06}},
+        persist_across_reloads=False,
+    )
+
+    assert litellm.model_cost[key]["max_input_tokens"] == 4096
+    assert litellm.model_cost[key]["input_cost_per_token"] == 5e-06
+
+
+def test_a_router_deployment_registers_a_datetime_in_its_model_info(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm import Router
+
+    monkeypatch.setattr(litellm, "model_cost", dict(litellm.model_cost))
+    created_at: Final = datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "lit-datetime-model",
+                "litellm_params": {
+                    "model": "openai/lit-datetime-model",
+                    "api_key": "fake-key-for-registration",
+                    "input_cost_per_token": 1e-06,
+                    "output_cost_per_token": 2e-06,
+                },
+                "model_info": {"id": "lit-datetime-deployment", "created_at": created_at},
+            }
+        ]
+    )
+
+    assert litellm.model_cost["lit-datetime-deployment"]["created_at"] == created_at
+    assert litellm.model_cost["lit-datetime-deployment"]["input_cost_per_token"] == 1e-06
+    del router

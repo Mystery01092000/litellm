@@ -39,7 +39,8 @@ mod _native {
     #[pymodule_export]
     use crate::model_cost::{
         NativeCostMapSource, NativeFetchFailed, NativeFetchPolicy, NativeFetched, NativeInstalled,
-        NativeModelCostMap, NativeModelCostMapState, NativeProvenance, NativeRejected,
+        NativeModelCostMap, NativeModelCostMapState, NativeProvenance, NativeRegistered,
+        NativeRejected, NativeTableSwapped,
     };
     #[pymodule_export]
     use crate::model_registry::bundled_model_cost_map;
@@ -175,6 +176,8 @@ mod tests {
                 "NativeModelCostMapState",
                 "NativeInstalled",
                 "NativeRejected",
+                "NativeRegistered",
+                "NativeTableSwapped",
                 "NativeProvenance",
                 "NativeCostMapSource",
                 "NativeFetchPolicy",

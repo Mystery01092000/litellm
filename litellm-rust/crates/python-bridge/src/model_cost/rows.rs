@@ -21,36 +21,79 @@ pub(crate) fn table<'py>(py: Python<'py>, rows: &[Row<'_>]) -> PyResult<Bound<'p
     Ok(table)
 }
 
-/// A plain dict, or main's `AliasedCostEntry` for a row with aliases or registered fields
+/// A plain dict, or main's `AliasedCostEntry` for a row with aliases
 fn model_row<'py>(py: Python<'py>, model: &ModelRow<'_>) -> PyResult<Bound<'py, PyAny>> {
     let fields = to_py(py, model.fields.as_ref())?.into_bound(py);
-    if model.names.is_empty() && model.registered_fields.is_empty() {
+    if model.names.is_empty() {
         return Ok(fields);
     }
     py.import(MODULE)?.getattr("entry")?.call1((
         fields,
         PyTuple::new(py, model.names)?,
-        PyFrozenSet::new(py, model.registered_fields.iter().copied())?,
+        PyFrozenSet::empty(py)?,
     ))
 }
 
-/// Writes one registration into `rows` the way main's `register_model` does and returns the row key it landed on
-pub(crate) fn write<'py>(
+/// Where a registration lands in a host's table and the row it starts from
+pub(crate) struct Landing<'py> {
+    pub(crate) key: String,
+    pub(crate) base: Bound<'py, PyAny>,
+    pub(crate) matched_builtin: bool,
+}
+
+/// Where `registration` lands in `rows`, or `None` when `rows` is not the table the host publishes, since the host
+/// looks keys up only in that one
+pub(crate) fn resolve<'py>(
     rows: &Bound<'py, PyDict>,
     key: &str,
     registration: &Bound<'py, PyAny>,
     custom_llm_provider: Option<&str>,
-    warning_display_name: Option<&str>,
-) -> PyResult<String> {
-    rows.py()
-        .import(MODULE)?
-        .getattr("write")?
-        .call1((
-            rows,
-            key,
-            registration,
-            custom_llm_provider,
-            warning_display_name,
-        ))?
-        .extract()
+) -> PyResult<Option<Landing<'py>>> {
+    let landing = rows.py().import(MODULE)?.getattr("resolve")?.call1((
+        rows,
+        key,
+        registration,
+        custom_llm_provider,
+    ))?;
+    if landing.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Landing {
+        key: landing.getattr("key")?.extract()?,
+        base: landing.getattr("base")?,
+        matched_builtin: landing.getattr("matched_builtin")?.extract()?,
+    }))
+}
+
+/// Writes `registration` over the row under `landing.key`, and under every alias name that shares that row object
+pub(crate) fn write<'py>(
+    rows: &Bound<'py, PyDict>,
+    landing: &Landing<'py>,
+    registration: &Bound<'py, PyAny>,
+) -> PyResult<()> {
+    let current = rows.get_item(&landing.key)?;
+    let row = rows.py().import(MODULE)?.getattr("merged")?.call1((
+        current.as_ref(),
+        &landing.base,
+        registration,
+    ))?;
+    let names: Vec<String> = row.getattr("names")?.extract()?;
+    let sharing: Vec<String> = names
+        .into_iter()
+        .filter(|name| {
+            rows.get_item(name)
+                .ok()
+                .flatten()
+                .is_some_and(|served| current.as_ref().is_some_and(|current| served.is(current)))
+        })
+        .collect();
+    rows.set_item(&landing.key, &row)?;
+    sharing
+        .iter()
+        .try_for_each(|name| rows.set_item(name, &row))
+}
+
+/// Tells the host a write landed in its table, so it drops what it derived from the table
+pub(crate) fn changed(py: Python<'_>) -> PyResult<()> {
+    py.import(MODULE)?.getattr("changed")?.call0().map(drop)
 }
