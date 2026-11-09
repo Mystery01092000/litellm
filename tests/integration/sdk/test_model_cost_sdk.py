@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -131,34 +131,37 @@ def _charged(rates: _Rates) -> object:
 _P1: Final = _catalog(1.0)
 _P2: Final = _catalog(2.0)
 _P3: Final = _catalog(3.0)
-_EXPECTED: Final[Mapping[str, Callable[[], list[object]]]] = {
-    "reload_reprices": lambda: [_charged(_P1), True, _charged(_P2)],
-    "failed_reload_keeps_prices": lambda: [_charged(_P1), False, _charged(_P1)],
-    "registration_survives_reload": lambda: [_charged(_P3), _charged(_P3), True, _charged(_P3), None],
-    "partial_registration_follows_reload": lambda: [
-        _charged(_custom_input(_P1)),
-        True,
-        _charged(_custom_input(_P2)),
+_FINETUNE_BUG: Final = pytest.mark.xfail(
+    strict=True,
+    reason="BUG: a fine-tune registered with only an input price bills output at 0 and cache reads at input",
+)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("reload_reprices", [_charged(_P1), True, _charged(_P2)]),
+        ("failed_reload_keeps_prices", [_charged(_P1), False, _charged(_P1)]),
+        ("registration_survives_reload", [_charged(_P3), _charged(_P3), True, _charged(_P3), None]),
+        ("partial_registration_follows_reload", [_charged(_custom_input(_P1)), True, _charged(_custom_input(_P2))]),
+        ("finetune_registration_bills_the_same_after_a_reload", [True, True, True]),
+        pytest.param(
+            "finetune_registration_inherits_the_base_prices", [_charged(_custom_input(_P1))], marks=_FINETUNE_BUG
+        ),
+        ("new_row_without_invalidating", [_charged(_P3)]),
+        ("new_row_then_invalidate", [None, _charged(_P3)]),
+        ("value_edited_in_place_then_invalidate", [_charged(_P1), _charged(_custom_input(_P1))]),
+        ("setdefault_update_then_invalidate", [_charged(_P1), _charged(_custom_input(_P1))]),
+        ("table_swapped_then_invalidate", [_charged(_P1), _charged(_P2)]),
+        ("table_swapped_then_helper_cache_cleared", [_charged(_P1), _charged(_P2)]),
+        ("contents_replaced_then_invalidate", [_charged(_P1), _charged(_P2)]),
+        ("finalized_snapshot_replaces_contents", [_charged(_P2)]),
+        ("popped_row_then_registered", [_charged(_P1), _charged(_P3)]),
+        ("fetched_map_validated", [True, True, False]),
     ],
-    "finetune_registration_bills_the_same_after_a_reload": lambda: [True, True, True],
-    "finetune_registration_inherits_the_base_prices": lambda: [_charged(_custom_input(_P1))],
-    "new_row_without_invalidating": lambda: [_charged(_P3)],
-    "new_row_then_invalidate": lambda: [None, _charged(_P3)],
-    "value_edited_in_place_then_invalidate": lambda: [_charged(_P1), _charged(_custom_input(_P1))],
-    "setdefault_update_then_invalidate": lambda: [_charged(_P1), _charged(_custom_input(_P1))],
-    "table_swapped_then_invalidate": lambda: [_charged(_P1), _charged(_P2)],
-    "table_swapped_then_helper_cache_cleared": lambda: [_charged(_P1), _charged(_P2)],
-    "contents_replaced_then_invalidate": lambda: [_charged(_P1), _charged(_P2)],
-    "finalized_snapshot_replaces_contents": lambda: [_charged(_P2)],
-    "popped_row_then_registered": lambda: [_charged(_P1), _charged(_P3)],
-    "fetched_map_validated": lambda: [True, True, False],
-}
-
-
-@pytest.mark.parametrize("case", tuple(_EXPECTED))
-def test_sdk_code_that_reads_or_writes_the_cost_map_bills_what_it_set_up(
-    case: str, cost_map_peer: Wire, tmp_path: Path
+    ids=lambda value: value if isinstance(value, str) else "",
+)
+def test_sdk_code_that_reads_or_writes_the_cost_map_gets_what_it_set_up(
+    case: str, expected: list[object], cost_map_peer: Wire, tmp_path: Path
 ) -> None:
-    if case == "finetune_registration_inherits_the_base_prices":
-        pytest.skip("BUG: a fine-tune registered with only an input price bills output at 0 and cache reads at input")
-    assert _run(case, cost_map_peer, tmp_path) == _EXPECTED[case]()
+    assert _run(case, cost_map_peer, tmp_path) == expected

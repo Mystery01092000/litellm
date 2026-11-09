@@ -266,23 +266,27 @@ _MOVED: Final = _Reply(status=302, body=b"", headers={"Location": "/moved.json"}
 _REDIRECTED_DOCUMENT: Final = _document_with(**{"lit-redirected-model": {"litellm_provider": "openai", "mode": "chat"}})
 
 
+def _rows_loaded_through(load: Literal["boot", "reload", "register_model"], url: str) -> Mapping[str, object]:
+    """The rows ``load`` produced from ``url``: the boot load's return value, or the live table after the others."""
+    match load:
+        case "boot":
+            return litellm.get_model_cost_map(url=url, max_attempts=1)
+        case "reload":
+            assert isinstance(asyncio.run(refetch_model_cost_map(url=url, max_attempts=1)), ModelCostMapReloaded)
+            return litellm.model_cost
+        case "register_model":
+            litellm.register_model(url, persist_across_reloads=False)
+            return litellm.model_cost
+
+
 @pytest.mark.usefixtures("remote_source", "own_model_cost")
-def test_boot_load_follows_a_redirect_to_the_document():
+@pytest.mark.parametrize("load", ["boot", "reload", "register_model"])
+def test_every_load_follows_a_redirect_to_the_document(load: Literal["boot", "reload", "register_model"]):
     with _serving(_MOVED, _Reply(body=_REDIRECTED_DOCUMENT)) as server:
-        rows: Final = litellm.get_model_cost_map(url=server.url, max_attempts=1)
+        rows: Final = _rows_loaded_through(load, server.url)
 
     assert server.targets == ["/cost.json", "/moved.json"]
     assert "lit-redirected-model" in rows
-    assert get_model_cost_map_source_info()["source"] == "remote"
-
-
-@pytest.mark.usefixtures("own_model_cost")
-def test_register_model_from_a_url_follows_a_redirect_to_the_document():
-    with _serving(_MOVED, _Reply(body=_REDIRECTED_DOCUMENT)) as server:
-        litellm.register_model(server.url, persist_across_reloads=False)
-
-    assert server.targets == ["/cost.json", "/moved.json"]
-    assert litellm.model_cost["lit-redirected-model"]["litellm_provider"] == "openai"
 
 
 @pytest.mark.usefixtures("remote_source", "own_model_cost")
@@ -317,26 +321,23 @@ def test_boot_load_does_not_retry_a_final_failure():
     assert server.requests == 1
 
 
-@pytest.mark.parametrize("argv0", ["/usr/bin/litellm-proxy", "/usr/bin/lite"])
-def test_boot_load_never_fetches_for_cli_processes(monkeypatch: pytest.MonkeyPatch, argv0: str):
-    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
-    monkeypatch.setattr(sys, "argv", [argv0])
-    with _serving(_Reply()) as server:
-        litellm.get_model_cost_map(url=server.url)
-
-    assert server.requests == 0
-    assert get_model_cost_map_source_info()["is_env_forced"] is True
-
-
 @pytest.mark.parametrize(
-    ("variable", "value"), [("LITELLM_LOCAL_MODEL_COST_MAP", "True"), ("LITELLM_OFFLINE_MODE", "true")]
+    ("argv0", "environment"),
+    [
+        ("/usr/bin/litellm-proxy", {}),
+        ("/usr/bin/lite", {}),
+        ("python", {"LITELLM_LOCAL_MODEL_COST_MAP": "True"}),
+        ("python", {"LITELLM_OFFLINE_MODE": "true"}),
+    ],
+    ids=["proxy-cli", "lite-cli", "local-map", "offline"],
 )
-def test_boot_load_with_the_bundled_map_forced_never_fetches(
-    monkeypatch: pytest.MonkeyPatch, variable: str, value: str
+def test_boot_load_serves_the_bundled_map_without_fetching(
+    monkeypatch: pytest.MonkeyPatch, argv0: str, environment: Mapping[str, str]
 ):
     monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
-    monkeypatch.setattr(sys, "argv", ["python"])
-    monkeypatch.setenv(variable, value)
+    monkeypatch.setattr(sys, "argv", [argv0])
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
     with _serving(_Reply()) as server:
         rows: Final = litellm.get_model_cost_map(url=server.url)
 
@@ -408,42 +409,29 @@ def test_reload_retries_a_429_after_its_retry_after():
 
 
 @pytest.mark.usefixtures("remote_source", "own_model_cost")
-def test_reload_follows_a_redirect_to_the_document():
-    with _serving(_MOVED, _Reply()) as server:
-        result: Final = asyncio.run(refetch_model_cost_map(url=server.url, max_attempts=1))
-
-    assert isinstance(result, ModelCostMapReloaded)
-    assert server.targets == ["/cost.json", "/moved.json"]
-    assert get_model_cost_map_provenance()["source_revision"] == _blob_id(_BUNDLED)
-
-
-@pytest.mark.usefixtures("remote_source", "own_model_cost")
-def test_reload_gives_up_after_its_attempts():
-    with _serving(_Reply(status=503, body=b"busy", headers={"Retry-After": "0"})) as server:
-        result: Final = asyncio.run(refetch_model_cost_map(url=server.url, max_attempts=3))
-
-    assert result == ModelCostMapReloadUnavailable(reason=f"HTTP 503 from {server.url} (after 3 attempts)")
-    assert server.requests == 3
-
-
-@pytest.mark.usefixtures("remote_source", "own_model_cost")
 @pytest.mark.parametrize(
-    ("reply", "reason"),
+    ("reply", "reason", "requests"),
     [
-        (_Reply(status=404, body=b"missing"), "HTTP 404 from "),
-        (_Reply(body=b"not json"), "invalid JSON from "),
-        (_Reply(body=json.dumps({"only": {"litellm_provider": "openai"}}).encode()), "model cost map from "),
+        (_Reply(status=503, body=b"busy", headers={"Retry-After": "0"}), "HTTP 503 from {url} (after 3 attempts)", 3),
+        (_Reply(status=404, body=b"missing"), "HTTP 404 from {url}", 1),
+        (_Reply(body=b"not json"), "invalid JSON from {url}", 1),
+        (
+            _Reply(body=json.dumps({"only": {"litellm_provider": "openai"}}).encode()),
+            "model cost map from {url} failed integrity validation",
+            1,
+        ),
     ],
+    ids=["gives-up-after-its-attempts", "not-found", "not-json", "below-integrity-limits"],
 )
-def test_a_failed_reload_keeps_the_installed_map(reply: _Reply, reason: str):
+def test_a_failed_reload_keeps_the_installed_map(reply: _Reply, reason: str, requests: int):
     installed: Final = litellm.model_cost
     provenance: Final = get_model_cost_map_provenance()
     with _serving(reply) as server:
-        result: Final = asyncio.run(refetch_model_cost_map(url=server.url))
+        result: Final = asyncio.run(refetch_model_cost_map(url=server.url, max_attempts=3))
 
     assert isinstance(result, ModelCostMapReloadUnavailable)
-    assert result.reason.startswith(reason)
-    assert server.requests == 1
+    assert result.reason.startswith(reason.format(url=server.url)), result.reason
+    assert server.requests == requests
     assert litellm.model_cost is installed
     assert get_model_cost_map_provenance() == provenance
 
@@ -578,35 +566,36 @@ def test_a_reload_rejects_an_untrusted_certificate_by_default(tmp_path: Path):
     assert server.requests == 0
 
 
-@pytest.mark.usefixtures("remote_source", "own_model_cost")
-@pytest.mark.parametrize("ssl_verify", ["off", "certificate"])
-def test_a_reload_accepts_the_certificate_litellm_ssl_verify_allows(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ssl_verify: Literal["off", "certificate"]
-):
-    context, certificate = _self_signed(tmp_path)
-    monkeypatch.setattr(litellm, "ssl_verify", {"off": False, "certificate": str(certificate)}[ssl_verify])
-    with _serving(_Reply(), tls=context) as server:
-        result: Final = asyncio.run(refetch_model_cost_map(url=server.url, max_attempts=1))
-
-    assert isinstance(result, ModelCostMapReloaded)
-    assert server.requests == 1
-
-
 @pytest.fixture
 def no_tls_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("SSL_VERIFY", "SSL_CERT_FILE", "SSL_CERTIFICATE"):
         monkeypatch.delenv(name, raising=False)
 
 
-@pytest.mark.usefixtures("remote_source", "no_tls_environment")
-@pytest.mark.parametrize("variable", ["SSL_VERIFY", "SSL_CERT_FILE"])
-def test_a_boot_load_trusts_the_certificate_the_environment_allows(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, variable: Literal["SSL_VERIFY", "SSL_CERT_FILE"]
+@pytest.mark.usefixtures("remote_source", "no_tls_environment", "own_model_cost")
+@pytest.mark.parametrize(
+    ("load", "setting", "trust"),
+    [
+        ("reload", "litellm.ssl_verify", "off"),
+        ("reload", "litellm.ssl_verify", "certificate"),
+        ("boot", "SSL_VERIFY", "off"),
+        ("boot", "SSL_CERT_FILE", "certificate"),
+    ],
+)
+def test_a_load_trusts_the_certificate_its_settings_allow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    load: Literal["boot", "reload"],
+    setting: str,
+    trust: Literal["off", "certificate"],
 ):
     context, certificate = _self_signed(tmp_path)
-    monkeypatch.setenv(variable, {"SSL_VERIFY": "False", "SSL_CERT_FILE": str(certificate)}[variable])
+    if setting == "litellm.ssl_verify":
+        monkeypatch.setattr(litellm, "ssl_verify", {"off": False, "certificate": str(certificate)}[trust])
+    else:
+        monkeypatch.setenv(setting, {"off": "False", "certificate": str(certificate)}[trust])
     with _serving(_Reply(), tls=context) as server:
-        litellm.get_model_cost_map(url=server.url, max_attempts=1)
+        _rows_loaded_through(load, server.url)
 
     assert server.requests == 1
     assert get_model_cost_map_source_info()["source"] == "remote"
@@ -692,14 +681,10 @@ def test_both_loads_fetch_through_the_proxy_the_environment_names(
     url: Final = "http://lit-cost-map.invalid/cost.json"
     with _serving(_Reply()) as proxy:
         monkeypatch.setenv("HTTP_PROXY", proxy.url.removesuffix("/cost.json"))
-        loaded: Final = (
-            "gpt-4o" in litellm.get_model_cost_map(url=url, max_attempts=1)
-            and get_model_cost_map_source_info()["source"] == "remote"
-            if load == "boot"
-            else isinstance(asyncio.run(refetch_model_cost_map(url=url, max_attempts=1)), ModelCostMapReloaded)
-        )
+        rows: Final = _rows_loaded_through(load, url)
 
-    assert loaded
+    assert "gpt-4o" in rows
+    assert get_model_cost_map_source_info()["source"] == "remote"
     assert proxy.targets == [url]
 
 

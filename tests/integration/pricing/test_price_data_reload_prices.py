@@ -570,6 +570,13 @@ def _billed_at(deployment: _Deployment, scale: float) -> Callable[[float | None]
     return lambda charged: charged == pytest.approx(expected, rel=1e-6)
 
 
+def _assert_a_failed_reload_keeps_prices(proxy: Gateway, server: _CostMapServer, served: _Failing) -> None:
+    server.serving = served
+    reload: Final = _reload(proxy)
+    assert reload.status_code == 502, (served, reload.text)
+    _charged_as_listed(proxy, _GEO_CATALOG, 1.0)
+
+
 @pytest.mark.timeout(4 * graceful_stop_seconds() + 180)
 def test_price_data_changes_only_through_a_successful_reload_or_a_restart(gateway: Gateway, tmp_path: Path) -> None:
     server: Final = _CostMapServer()
@@ -584,10 +591,7 @@ def test_price_data_changes_only_through_a_successful_reload_or_a_restart(gatewa
                 holding=3 * _POLL_SECONDS,
             )
             for status in (404, 503):
-                server.serving = _Failing(status)
-                reload: Final = _reload(first.gateway)
-                assert reload.status_code == 502, (status, reload.text)
-                _charged_as_listed(first.gateway, _GEO_CATALOG, 1.0)
+                _assert_a_failed_reload_keeps_prices(first.gateway, server, _Failing(status))
             server.serving = _Published(_PUBLISHED_SCALE)
         with _lifecycle_proxy(gateway, tmp_path, wire.url, (_GEO_CATALOG,), database=database) as restarted:
             _charged_as_listed(restarted.gateway, _GEO_CATALOG, _PUBLISHED_SCALE)

@@ -11,8 +11,8 @@ from typing import Final
 
 import pytest
 
-from litellm.rust_bridge.host.model_cost import AliasedCostEntry
 from litellm.rust_bridge._native import NativeInstalled, NativeModelCostMap, NativeRejected
+from litellm.rust_bridge.host.model_cost import AliasedCostEntry
 
 
 def _install(document: dict[str, dict[str, object]]) -> NativeInstalled:
@@ -85,42 +85,51 @@ class TestExpandModelAliases:
 # ---------------------------------------------------------------------------
 
 
-class TestAliasConflicts:
-    def test_alias_conflicts_with_canonical_entry(self):
-        """Alias that matches an existing canonical entry is skipped."""
-        result = _installed(
+@pytest.mark.parametrize(
+    ("document", "name", "row", "other", "shared"),
+    [
+        pytest.param(
             {
                 "model-latest": _row(aliases=["model-dated"], input_cost_per_token=1e-06),
                 "model-dated": _row(input_cost_per_token=5e-06),
-            }
-        )
-
-        assert result["model-dated"]["input_cost_per_token"] == 5e-06
-        assert result["model-dated"] is not result["model-latest"]
-
-    def test_an_alias_naming_an_earlier_entry_leaves_that_entry_alone(self):
-        """An alias declared after the entry it names never overwrites that entry."""
-        result = _installed(
+            },
+            "model-dated",
+            _row(input_cost_per_token=5e-06),
+            "model-latest",
+            False,
+            id="alias-names-a-later-entry",
+        ),
+        pytest.param(
             {
                 "existing-model": _row(input_cost_per_token=9.99e-06),
                 "other-model": _row(aliases=["existing-model"], input_cost_per_token=1e-06),
-            }
-        )
-
-        assert result["existing-model"] == _row(input_cost_per_token=9.99e-06)
-        assert result["existing-model"] is not result["other-model"]
-
-    def test_duplicate_alias_across_entries(self):
-        """Same alias claimed by two different entries: the first one keeps it."""
-        result = _installed(
+            },
+            "existing-model",
+            _row(input_cost_per_token=9.99e-06),
+            "other-model",
+            False,
+            id="alias-names-an-earlier-entry",
+        ),
+        pytest.param(
             {
                 "model-a": _row(aliases=["shared-alias"], input_cost_per_token=1e-06),
                 "model-b": _row(aliases=["shared-alias"], input_cost_per_token=2e-06),
-            }
-        )
+            },
+            "shared-alias",
+            _row(input_cost_per_token=1e-06),
+            "model-a",
+            True,
+            id="two-entries-claim-one-alias",
+        ),
+    ],
+)
+def test_an_alias_never_replaces_a_model_name_and_the_first_claim_wins(
+    document: dict[str, dict[str, object]], name: str, row: dict[str, object], other: str, shared: bool
+):
+    result: Final = _installed(document)
 
-        assert result["shared-alias"] is result["model-a"]
-        assert result["shared-alias"]["input_cost_per_token"] == 1e-06
+    assert result[name] == row
+    assert (result[name] is result[other]) is shared
 
 
 class TestAliasOfRows:
