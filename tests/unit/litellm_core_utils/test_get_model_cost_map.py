@@ -797,10 +797,8 @@ def test_get_model_info_follows_a_reload_and_a_registration():
     install_model_cost_map(_document_with(**{"gpt-4o": {"litellm_provider": "openai", "input_cost_per_token": 0.5}}))
     assert litellm.get_model_info("gpt-4o")["input_cost_per_token"] == 0.5
 
-    generation: Final = litellm.utils.get_model_cost_mutation_generation()
     litellm.register_model({"gpt-4o": {"input_cost_per_token": 0.25}})
     assert litellm.get_model_info("gpt-4o")["input_cost_per_token"] == 0.25
-    assert litellm.utils.get_model_cost_mutation_generation() > generation
 
 
 @pytest.mark.usefixtures("own_model_cost")
@@ -996,3 +994,38 @@ def test_case_insensitive_lookups_go_through_the_live_dict(monkeypatch: pytest.M
     assert get_model_cost_key("GPT-4O") == "gpt-4o"
     assert get_model_cost_key("lit-mixed-case") == "Lit-Mixed-Case"
     assert get_model_cost_key("lit-unknown") is None
+
+
+def test_main_cost_map_names_downstream_code_calls_stay_callable_with_their_main_signatures():
+    # Not an API we would design today. Downstream SDK code calls these names from main directly (open-arena, pflow,
+    # preloop, Skyvern, benchflow, EpicStaff, autorubric, ai-shifu, vscode-graph-agent, ccrelay, Raven), so removing
+    # one breaks it. Their behavior is pinned in tests/integration/sdk/test_model_cost_sdk.py
+    import inspect
+
+    from litellm.litellm_core_utils import get_model_cost_map as cost_map_module
+    from litellm.litellm_core_utils.get_model_cost_map import AliasedCostEntry, GetModelCostMap, ModelCostMapReloaded
+
+    assert litellm.utils._model_cost_lowercase_map is None
+    generation: Final = litellm.utils.get_model_cost_mutation_generation()
+    litellm.utils._invalidate_model_cost_lowercase_map()
+    assert litellm.utils.get_model_cost_mutation_generation() > generation
+    for cached in (
+        litellm.utils._cached_get_model_info,
+        litellm.utils._cached_get_model_info_helper,
+        litellm.utils.cached_cost_map_key,
+        litellm.get_model_info,
+    ):
+        cached.cache_clear()
+        assert cached.cache_info().currsize == 0
+    assert litellm.utils._cached_get_model_info("gpt-4o")["key"] == "gpt-4o"
+    assert GetModelCostMap.get_backup_model_count() == GetModelCostMap._get_backup_model_count() > 0
+    assert GetModelCostMap.validate_model_cost_map(fetched_map={}, backup_model_count=1) is False
+    for function, arguments in (
+        (cost_map_module.refetch_model_cost_map, {"url": "u", "timeout": 5, "max_attempts": 1, "client": None}),
+        (cost_map_module.get_model_cost_map, {"url": "u", "timeout": 5, "max_attempts": 1, "sleep": None, "rng": None}),
+        (cost_map_module.adopt_model_cost_map, {"new_model_cost_map": {}}),
+        (cost_map_module._finalize_model_cost_map, {"model_cost": {}}),
+    ):
+        inspect.signature(function).bind(**arguments)
+    assert {"model_cost_map", "revision", "etag"} <= set(dir(ModelCostMapReloaded))
+    assert issubclass(AliasedCostEntry, dict)

@@ -1,8 +1,13 @@
-"""The Python side of the model cost table that Rust asks for: the row type, how a kept registration merges and what
-Python derives from the table (all belong to the Python host), and the registration lookup and row merge (shims until
-lookup moves to Rust).
+"""The Python host of the model cost table: ``litellm.model_cost``, its row type, every write litellm makes to it and
+the version that moves with each write. Rust asks it where a registration lands and how rows merge (shims until
+lookup moves to Rust), and writes registrations through it.
 
-Contract for every function here:
+Anything derived from the table is cached under ``model_cost_version()``, so a write is never followed by a read of
+what was derived before it. The version also carries the table's identity and size, so a caller that swaps
+``litellm.model_cost`` or adds or removes a key without coming here still moves it. Changing a value in place
+without coming here does not.
+
+Contract for every function Rust calls here:
 - Rust calls it synchronously with the GIL held and no ``NativeModelCostMap`` lock held, since ``resolve`` reaches
   ``find_key`` through ``get_model_info``.
 - Values cross as Python objects. Rows and registrations can hold values JSON cannot (``datetime`` in router
@@ -12,10 +17,93 @@ Contract for every function here:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import Final, Generic, ParamSpec, TypeVar
 
-from litellm.litellm_core_utils.get_model_cost_map import AliasedCostEntry
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+class AliasedCostEntry(dict[str, object]):
+    """A ``litellm.model_cost`` row, the one object every alias name of a model is served under."""
+
+    __slots__ = ("names", "registered_fields")
+
+    def __init__(
+        self, entry: Mapping[str, object], names: tuple[str, ...], registered_fields: frozenset[str] = frozenset()
+    ) -> None:
+        super().__init__(entry)
+        self.names: tuple[str, ...] = names
+        self.registered_fields: frozenset[str] = registered_fields
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCostVersion:
+    table: int
+    size: int
+    writes: int
+
+
+class _Writes:
+    __slots__ = ("count",)
+
+    def __init__(self) -> None:
+        self.count: int = 0
+
+    def record(self) -> None:
+        self.count += 1
+
+
+_WRITES: Final = _Writes()
+
+
+def model_cost_version() -> ModelCostVersion:
+    import litellm
+
+    table: Final = litellm.model_cost
+    return ModelCostVersion(table=id(table), size=len(table), writes=_WRITES.count)
+
+
+def changed_in_place() -> None:
+    """Moves the version after a caller changed ``litellm.model_cost`` in place without going through here."""
+    _WRITES.record()
+
+
+class VersionCached(Generic[P, R]):
+    """``function`` cached for the ``litellm.model_cost`` version each call read, with ``lru_cache``'s
+    ``cache_clear`` and ``cache_info``."""
+
+    __slots__ = ("_at", "cache_clear", "cache_info")
+
+    def __init__(self, function: Callable[P, R], maxsize: int) -> None:
+        def at(
+            _version: ModelCostVersion,
+            *args: P.args,
+            **kwargs: P.kwargs,  # kwargs-ok: forwards a ParamSpec unchanged
+        ) -> R:
+            return function(*args, **kwargs)
+
+        cached: Final = lru_cache(maxsize=maxsize)(at)
+        self._at: Final = cached
+        self.cache_clear: Final = cached.cache_clear
+        self.cache_info: Final = cached.cache_info
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:  # kwargs-ok: forwards a ParamSpec unchanged
+        return self._at(model_cost_version(), *args, **kwargs)
+
+
+def cached_per_version(maxsize: int) -> Callable[[Callable[P, R]], VersionCached[P, R]]:
+    return lambda function: VersionCached(function, maxsize)
+
+
+def publish(table: dict[str, object]) -> None:
+    """Makes ``table`` the live ``litellm.model_cost``."""
+    import litellm
+
+    litellm.model_cost = table
+    _WRITES.record()
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,9 +160,8 @@ def kept(previous: dict[str, object] | None, registration: Mapping[str, object])
     return update_dictionary(dict(previous or {}), registration)
 
 
-def changed() -> None:
-    """Drops what Python derives from ``litellm.model_cost`` after a write landed in it. Rust calls it after every
-    entry, because the next entry's lookup reads through the ``get_model_info`` cache."""
-    from litellm.utils import model_cost_changed
-
-    model_cost_changed()
+def write(rows: dict[str, object], written: Mapping[str, object]) -> None:
+    """Writes one registration's rows into ``rows``, the published table. Rust calls it once per entry, because the
+    next entry's lookup reads through caches keyed on the version this moves."""
+    rows.update(written)
+    _WRITES.record()

@@ -75,7 +75,7 @@ pub(crate) fn kept<'py>(
     Ok(call(registration.py(), "kept", (previous, registration))?.cast_into::<PyDict>()?)
 }
 
-/// Drops what the host derived from the table after a write landed in it
-pub(crate) fn changed(py: Python<'_>) -> PyResult<()> {
-    call(py, "changed", ()).map(drop)
+/// Writes `written` into `rows`, the published table, through the host, which tracks the table's version
+pub(crate) fn write(rows: &Bound<'_, PyDict>, written: &Bound<'_, PyDict>) -> PyResult<()> {
+    call(rows.py(), "write", (rows, written)).map(drop)
 }

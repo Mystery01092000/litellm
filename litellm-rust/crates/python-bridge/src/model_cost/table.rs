@@ -160,8 +160,10 @@ pub(crate) fn write<'py>(
                 .is_some_and(|(served, current)| served.is(current))
         })
         .collect();
-    rows.set_item(&landing.key, &row)?;
+    let written = PyDict::new(rows.py());
+    written.set_item(&landing.key, &row)?;
     sharing
         .into_iter()
-        .try_for_each(|name| rows.set_item(name, &row))
+        .try_for_each(|name| written.set_item(name, &row))?;
+    host::write(rows, &written)
 }

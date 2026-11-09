@@ -1086,7 +1086,7 @@ async def test_model_cost_map_reload_does_not_publish_config_change() -> None:
     from litellm.proxy import proxy_server
     from litellm.proxy.proxy_server import ProxyConfig, _set_redis_usage_cache
     from litellm.proxy.utils import litellm_config_cache
-    from litellm.utils import model_cost_changed
+    from litellm.rust_bridge.host.model_cost import publish
 
     litellm_config_cache.flush_cache()
     prisma_client = _reload_config_prisma_client()
@@ -1105,8 +1105,7 @@ async def test_model_cost_map_reload_does_not_publish_config_change() -> None:
         ):
             await ProxyConfig()._check_and_reload_model_cost_map(prisma_client=prisma_client)
     finally:
-        litellm.model_cost = original_model_cost
-        model_cost_changed()
+        publish(original_model_cost)
         _set_redis_usage_cache(previous_cache)
 
     prisma_client.db.litellm_config.update_many.assert_awaited_once()

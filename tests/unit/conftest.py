@@ -134,7 +134,7 @@ os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
 import litellm  # noqa: E402  # litellm reads LITELLM_LOCAL_MODEL_COST_MAP at import
-import litellm.utils as litellm_utils_module  # noqa: E402  # same import-time dependency
+from litellm.rust_bridge.host.model_cost import publish  # noqa: E402  # same import-time dependency
 from litellm._logging import ALL_LOGGERS  # noqa: E402  # same import-time dependency
 from litellm.anthropic_beta_headers_manager import (
     reload_beta_headers_config,  # noqa: E402  # same import-time dependency
@@ -441,13 +441,13 @@ def isolate_router_model_cost_state() -> Iterator[None]:
     original_live_registries: Final = frozenset(live_router_registries)
     original_model_cost_inputs: Final = model_cost_inputs.snapshot()
     model_cost_inputs.restore(_IMPORTED_MODEL_COST_INPUTS)
-    litellm_utils_module.model_cost_changed()
+    publish(litellm.model_cost)
     live_router_registries.clear()
     yield
     live_router_registries.clear()
     live_router_registries.update(original_live_registries)
     model_cost_inputs.restore(original_model_cost_inputs)
-    litellm_utils_module.model_cost_changed()
+    publish(litellm.model_cost)
     litellm.get_model_info.cache_clear()
 
 
@@ -471,7 +471,7 @@ def isolate_model_catalog() -> Iterator[None]:
     for models, entries in provider_model_sets:
         models.clear()
         models.update(entries)
-    litellm_utils_module.model_cost_changed()
+    publish(litellm.model_cost)
     litellm.get_model_info.cache_clear()
 
 

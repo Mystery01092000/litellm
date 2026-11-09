@@ -59,7 +59,7 @@ from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.db.db_transaction_queue.window_spend_update_queue import WindowSpendUpdateQueue
 from litellm.proxy.hooks.parallel_request_limiter_v3 import RequestRateLimiterStash
 from litellm.proxy.proxy_server import app, aws_error_type_exception_handler, initialize, openai_exception_handler
-from litellm.utils import model_cost_changed
+from litellm.rust_bridge.host.model_cost import publish
 from litellm.proxy.common_utils.banner import LITELLM_BANNER
 from tests._master_key import MASTER_KEY
 from litellm.redis.stores.connection import connect
@@ -4728,8 +4728,7 @@ class TestPriceDataReloadAPI:
                     assert data["models_count"] == 1
         finally:
             # Restore the full model cost map so subsequent tests are not affected
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     def test_reload_model_cost_map_non_admin_access(self, client_with_auth, monkeypatch):
         """Test that non-admin users cannot access the reload endpoint"""
@@ -4984,8 +4983,7 @@ class TestPriceDataReloadIntegration:
                     response = client_with_auth.get("/public/litellm_model_cost_map")
                     assert response.status_code == 200
         finally:
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     def test_pod_data_clock_seeded_from_actual_cost_map_load(self):
         """Regression: seeding from ProxyConfig construction time instead of the real
@@ -5055,8 +5053,7 @@ class TestPriceDataReloadIntegration:
                 mock_prisma.db.litellm_config.upsert.assert_not_called()
                 assert proxy_config.model_cost_map_applied_revision == 4
         finally:
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     def test_distributed_reload_ignores_already_applied_request(self):
         """
@@ -5094,8 +5091,7 @@ class TestPriceDataReloadIntegration:
                 mock_prisma.db.litellm_config.update_many.assert_not_called()
                 assert proxy_config.model_cost_map_loaded_at == pod_data_loaded_at
         finally:
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     def test_periodic_reload_uses_pod_local_data_age(self):
         """
@@ -5144,8 +5140,7 @@ class TestPriceDataReloadIntegration:
                 mock_prisma.db.litellm_config.update_many.assert_not_called()
                 assert proxy_config.model_cost_map_loaded_at == frozen_now - timedelta(hours=1)
         finally:
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     def test_every_pod_applies_a_manual_revision_exactly_once(self):
         """The fleet property: no pod clears the revision, so each one reloads on the tick
@@ -5180,8 +5175,7 @@ class TestPriceDataReloadIntegration:
                 assert mock_get_map.call_count == len(pods)
                 assert all(p.model_cost_map_applied_revision == 1 for p in pods)
         finally:
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     @pytest.mark.parametrize(
         "published_revision, expect_reload",
@@ -5223,8 +5217,7 @@ class TestPriceDataReloadIntegration:
                 assert mock_get_map.call_count == (1 if expect_reload else 0)
                 assert proxy_config.model_cost_map_applied_revision == published_revision
         finally:
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     def test_distributed_reload_stamps_last_run_without_creating_row(self):
         """
@@ -5262,8 +5255,7 @@ class TestPriceDataReloadIntegration:
                 mock_prisma.db.litellm_config.upsert.assert_not_called()
                 mock_prisma.db.litellm_config.create.assert_not_called()
         finally:
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     def test_distributed_reload_leaves_request_unserved_when_status_write_fails(self):
         """
@@ -5299,8 +5291,7 @@ class TestPriceDataReloadIntegration:
 
                 assert proxy_config.model_cost_map_applied_revision == 0
         finally:
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     def test_distributed_reload_keeps_current_map_when_fetch_fails(self):
         """Fetch failure during a periodic reload must not downgrade the pod or count the
@@ -5392,8 +5383,7 @@ class TestPriceDataReloadIntegration:
             assert "gpt-4o" in litellm.model_cost
             assert proxy_config.model_cost_map_applied_revision == 7
         finally:
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     def test_install_counts_the_fetched_catalog_only(self):
         """The count the reload endpoints report describes the price data, so the
@@ -5410,8 +5400,7 @@ class TestPriceDataReloadIntegration:
             assert reloaded == ModelCostMapReloaded(model_count=len(litellm.model_cost) - 1)
             assert litellm.model_cost["custom/deployment-model"]["max_input_tokens"] == 4321
         finally:
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     def test_manual_reload_preserves_interval_hours(self, monkeypatch):
         """
@@ -5469,8 +5458,7 @@ class TestPriceDataReloadIntegration:
                     "the serving pod must adopt the revision it published, not reload again"
                 )
         finally:
-            litellm.model_cost = original_model_cost
-            model_cost_changed()
+            publish(original_model_cost)
 
     def test_anthropic_beta_headers_reload_preserves_interval_hours(self):
         """Test that _check_and_reload_anthropic_beta_headers preserves interval_hours after reload.

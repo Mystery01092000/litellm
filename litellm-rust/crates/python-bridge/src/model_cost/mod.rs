@@ -383,7 +383,6 @@ impl<'py> RegistrationTable for PublishedTable<'_, 'py> {
     ) -> PyResult<Placed> {
         table::write(self.rows, &landing, registration)?;
         self.map.invalidate();
-        host::changed(self.rows.py())?;
         Ok(Placed {
             key: landing.key,
             matched_builtin: landing.matched_builtin,
@@ -433,8 +432,8 @@ def resolve(rows, key, registration, custom_llm_provider):
 def merged(current, base, registration):
     return Row({**(current or {}), **base, **registration})
 
-def changed():
-    pass
+def write(rows, written):
+    rows.update(written)
 "#
     );
 

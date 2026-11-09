@@ -103,7 +103,6 @@ from litellm.litellm_core_utils.fallback_generalizations import (
     match_fill_missing_generalizations,
 )
 from litellm.litellm_core_utils.get_model_cost_map import (
-    AliasedCostEntry,
     GetModelCostMap,
     fetch_registration_document,
     model_cost_inputs,
@@ -122,6 +121,12 @@ from litellm.rust_bridge import tokenizer as tokenizer_dispatch
 from litellm.rust_bridge._native import NativeModelCostMap, NativeRegistered
 from litellm.rust_bridge.catalog import decision
 from litellm.rust_bridge.configuration import Decision
+from litellm.rust_bridge.host.model_cost import (
+    AliasedCostEntry,
+    cached_per_version,
+    changed_in_place,
+    model_cost_version,
+)
 
 _CachingHandlerResponse = None
 _LLMCachingHandler = None
@@ -6727,25 +6732,16 @@ def _strip_model_name(model: str, custom_llm_provider: str | None) -> str:
         return _strip_dated_snapshot_suffix(model_name=model)
 
 
-# Monotonic counter bumped on every model_cost mutation. Consumers that
-# memoize derived state (e.g. provider-specific indices) can include this
-# value in their cache key so they invalidate even when key add+remove or
-# in-place value replacement leaves len/id unchanged.
-_model_cost_mutation_generation: int = 0
+# Main's private cost map hooks. Downstream code calls them after writing to litellm.model_cost directly
+_model_cost_lowercase_map: Final[None] = None
+
+
+def _invalidate_model_cost_lowercase_map() -> None:  # pyright: ignore[reportUnusedFunction]  # downstream code calls main's name
+    changed_in_place()
 
 
 def get_model_cost_mutation_generation() -> int:
-    return _model_cost_mutation_generation
-
-
-def model_cost_changed() -> None:
-    """Clears what is derived from ``litellm.model_cost`` after litellm wrote to it: the ``get_model_info`` caches
-    and the mutation counter. The name index follows the dict on its own."""
-    global _model_cost_mutation_generation
-    _model_cost_mutation_generation += 1
-    _cached_get_model_info.cache_clear()
-    cached_get_model_info_helper.cache_clear()
-    cached_cost_map_key.cache_clear()
+    return model_cost_version().writes
 
 
 def get_model_cost_key(potential_key: str) -> str | None:
@@ -7016,7 +7012,7 @@ def _get_max_position_embeddings(model_name: str) -> int | None:
         return None
 
 
-@lru_cache(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
+@cached_per_version(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
 def cached_get_model_info_helper(
     model: str,
     custom_llm_provider: str | None,
@@ -7024,11 +7020,6 @@ def cached_get_model_info_helper(
     *,
     preserve_unset_costs: bool = False,
 ) -> ModelInfoBase:
-    """
-    _get_model_info_helper wrapped with lru_cache
-
-    Speed Optimization to hit high RPS
-    """
     return get_model_info_helper(
         model=model,
         custom_llm_provider=custom_llm_provider,
@@ -7040,7 +7031,7 @@ def cached_get_model_info_helper(
 _cached_get_model_info_helper = cached_get_model_info_helper
 
 
-@lru_cache(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
+@cached_per_version(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
 def cached_cost_map_key(model: str, custom_llm_provider: str | None) -> str | None:
     try:
         return cached_get_model_info_helper(model=model, custom_llm_provider=custom_llm_provider)["key"]
@@ -7600,7 +7591,7 @@ def _build_model_info(
     return ModelInfo(**_model_info, supported_openai_params=supported_openai_params)
 
 
-@lru_cache(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
+@cached_per_version(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
 def _cached_get_model_info(
     model: str,
     custom_llm_provider: str | None = None,

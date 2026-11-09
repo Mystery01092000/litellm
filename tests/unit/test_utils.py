@@ -88,7 +88,6 @@ from litellm.secret_managers.main import oidc_cache
 from litellm.types.videos.main import VideoObject
 from litellm.utils import (
     acredential_updates,
-    model_cost_changed,
     add_custom_logger_callback_to_specific_event,
     check_valid_key,
     CustomStreamWrapper,
@@ -121,6 +120,7 @@ from litellm.utils import (
     validate_environment,
     validate_chat_completion_tool_choice,
 )
+from litellm.rust_bridge.host.model_cost import publish
 
 
 @pytest.mark.parametrize("root_base_model", [42, ["gemini-3.5-flash"], {"model": "gemini-3.5-flash"}])
@@ -2524,11 +2524,9 @@ def test_register_model_with_scientific_notation():
     test_model_name = f"test-scientific-notation-model-{uuid.uuid4().hex[:12]}"
 
     # Clear LRU caches that might have stale data
-    from litellm.utils import (
-        model_cost_changed,
-    )
+    from litellm.rust_bridge.host.model_cost import publish
 
-    model_cost_changed()
+    publish(litellm.model_cost)
     model_cost_dict = {
         test_model_name: {
             "max_tokens": 8192,
@@ -2551,7 +2549,7 @@ def test_register_model_with_scientific_notation():
     # Clean up after test
     if test_model_name in litellm.model_cost:
         del litellm.model_cost[test_model_name]
-    model_cost_changed()
+    publish(litellm.model_cost)
 
 
 @pytest.mark.usefixtures("isolated_openai_model_sets")
@@ -5206,9 +5204,9 @@ def test_reapply_runtime_registrations_replays_register_model_overrides(
     """
     from litellm import utils as litellm_utils
     from litellm.utils import (
-        model_cost_changed,
         reapply_runtime_model_cost_registrations,
     )
+    from litellm.rust_bridge.host.model_cost import publish
 
     # Only the recorded half is under test here; the live-router rebuild is covered
     # in test_router_model_cost_isolation.py. Routers built by earlier tests in this
@@ -5243,7 +5241,7 @@ def test_reapply_runtime_registrations_replays_register_model_overrides(
                 "max_input_tokens": 4242,
             }
         }
-        model_cost_changed()
+        publish(litellm.model_cost)
         reapply_runtime_model_cost_registrations()
 
         expected_rate: Final = rate if updated_rate is None else updated_rate
@@ -5251,8 +5249,7 @@ def test_reapply_runtime_registrations_replays_register_model_overrides(
         assert litellm.model_cost["openai/gpt-4o"]["supports_function_calling"] is False
         assert litellm.model_cost["openai/gpt-4o"]["max_input_tokens"] == 4242
     finally:
-        litellm.model_cost = saved_model_cost
-        model_cost_changed()
+        publish(saved_model_cost)
 
 
 @pytest.mark.usefixtures("isolated_openai_model_sets", "local_model_cost_map")
@@ -5264,9 +5261,9 @@ def test_reapply_runtime_registrations_drops_request_scoped_registrations(monkey
     pricing forever, while a durable override registered alongside it survives.
     """
     from litellm.utils import (
-        model_cost_changed,
         reapply_runtime_model_cost_registrations,
     )
+    from litellm.rust_bridge.host.model_cost import publish
 
     saved_model_cost = litellm.model_cost
     try:
@@ -5283,18 +5280,17 @@ def test_reapply_runtime_registrations_drops_request_scoped_registrations(monkey
             "openai/gpt-4o": {"litellm_provider": "openai", "input_cost_per_token": 0.000999},
             "openai/gpt-4o-mini": {"litellm_provider": "openai", "input_cost_per_token": 0.000888},
         }
-        model_cost_changed()
+        publish(litellm.model_cost)
         reapply_runtime_model_cost_registrations()
 
         assert litellm.model_cost["openai/gpt-4o"]["input_cost_per_token"] == 0.000111
         assert litellm.model_cost["openai/gpt-4o-mini"]["input_cost_per_token"] == 0.000888
     finally:
-        litellm.model_cost = saved_model_cost
-        model_cost_changed()
+        publish(saved_model_cost)
 
 
 def test_model_cost_walks_survive_a_registration_landing_mid_walk(monkeypatch: pytest.MonkeyPatch) -> None:
-    from litellm.utils import model_cost_changed
+    from litellm.rust_bridge.host.model_cost import publish
 
     class _EntryRegisteredMidWalk(dict):
         def get(self, field: str, default: object = None) -> object:
@@ -5307,7 +5303,7 @@ def test_model_cost_walks_survive_a_registration_landing_mid_walk(monkeypatch: p
         litellm.add_known_models(model_cost_map=litellm.model_cost)
         assert "lit-5853-registered-during-add-known-models" in litellm.model_cost
     finally:
-        model_cost_changed()
+        publish(litellm.model_cost)
 
 
 def _register_a_model_mid_walk() -> None:
@@ -5343,7 +5339,7 @@ def test_request_path_cost_map_walks_survive_a_registration_mid_walk(
     from litellm.llms.fireworks_ai.chat.transformation import FireworksAIConfig
     from litellm.llms.ollama.common_utils import OllamaModelInfo
     from litellm.llms.openai.chat.gpt_reasoning_transformation import _catalogue_declares_default_effort
-    from litellm.utils import model_cost_changed
+    from litellm.rust_bridge.host.model_cost import publish
 
     walks: Final[Mapping[str, Callable[[], object]]] = {
         "fal_ai": lambda: _keyed_rows("lit-5853-model", "standard"),
@@ -5361,7 +5357,7 @@ def test_request_path_cost_map_walks_survive_a_registration_mid_walk(
         walks[walk]()
         assert "lit-5853-registered-mid-walk" in litellm.model_cost
     finally:
-        model_cost_changed()
+        publish(litellm.model_cost)
 
 
 class _JsonCapture(logging.Handler):
@@ -8483,7 +8479,7 @@ def test_get_model_info_gemini(monkeypatch):
 def test_register_model_without_a_provider_never_inherits_another_providers_entry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from litellm.utils import model_cost_changed
+    from litellm.rust_bridge.host.model_cost import publish
 
     key: Final = "azure/claude-sonnet-4-6"
     monkeypatch.setattr(litellm, "model_cost", dict(litellm.model_cost))
@@ -8498,7 +8494,7 @@ def test_register_model_without_a_provider_never_inherits_another_providers_entr
         assert info["input_cost_per_token"] == 1e-07
         assert info["output_cost_per_token"] == 4e-07
     finally:
-        model_cost_changed()
+        publish(litellm.model_cost)
 
 
 @pytest.mark.parametrize(
@@ -8516,7 +8512,7 @@ def test_register_model_without_a_provider_never_inherits_another_providers_entr
 def test_register_model_over_a_builtin_row_bills_explicit_cache_hits(
     monkeypatch: pytest.MonkeyPatch, registered_prices: dict[str, float], billed_cache_read_rate: float
 ) -> None:
-    from litellm.utils import model_cost_changed
+    from litellm.rust_bridge.host.model_cost import publish
 
     key: Final = "dashscope/qwen-register-explicit-cache-test"
     monkeypatch.setattr(litellm, "model_cost", dict(litellm.model_cost))
@@ -8528,7 +8524,7 @@ def test_register_model_over_a_builtin_row_bills_explicit_cache_hits(
         "cache_read_input_token_cost": 5e-07,
         "explicit_cache_read_input_token_cost": 2.5e-07,
     }
-    model_cost_changed()
+    publish(litellm.model_cost)
     try:
         litellm.register_model({key: registered_prices}, persist_across_reloads=False)
         explicit_hit: Final = ModelResponse(
@@ -8543,7 +8539,7 @@ def test_register_model_over_a_builtin_row_bills_explicit_cache_hits(
             1000 * billed_cache_read_rate
         )
     finally:
-        model_cost_changed()
+        publish(litellm.model_cost)
 
 
 @pytest.mark.parametrize(
@@ -8923,7 +8919,7 @@ def isolate_litellm_state():
     for attr, original_value in original_state.items():
         if hasattr(litellm, attr):
             setattr(litellm, attr, original_value)
-    model_cost_changed()
+    publish(litellm.model_cost)
 
 
 _SCALAR_DEFAULTS = {
@@ -11586,7 +11582,7 @@ def test_the_catalog_with_register_model_entries_lists_each_model_once_and_leave
 )
 def test_runtime_model_cost_registrations_resolve_bedrock_routing(monkeypatch: pytest.MonkeyPatch, key: str) -> None:
     from litellm import utils as model_utils
-    from litellm.litellm_core_utils.get_model_cost_map import AliasedCostEntry
+    from litellm.rust_bridge.host.model_cost import AliasedCostEntry
 
     rates: Final = {"input_cost_per_token": 0.001, "output_cost_per_token": 0.002}
     alias: Final = "openai.test-converse-alias"

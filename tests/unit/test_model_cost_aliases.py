@@ -11,7 +11,7 @@ from typing import Final
 
 import pytest
 
-from litellm.litellm_core_utils.get_model_cost_map import AliasedCostEntry
+from litellm.rust_bridge.host.model_cost import AliasedCostEntry
 from litellm.rust_bridge._native import NativeInstalled, NativeModelCostMap, NativeRejected
 
 

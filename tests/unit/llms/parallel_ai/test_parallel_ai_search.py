@@ -57,13 +57,13 @@ def bundled_cost_map(monkeypatch):
     litellm caches model-info lookups, so swapping ``model_cost`` only takes
     effect once those caches are invalidated -- on the way in and back out.
     """
-    from litellm.utils import model_cost_changed
+    from litellm.rust_bridge.host.model_cost import publish
 
     monkeypatch.setattr(litellm, "model_cost", litellm.get_model_cost_map(url=""))
-    model_cost_changed()
+    publish(litellm.model_cost)
     yield
     monkeypatch.undo()
-    model_cost_changed()
+    publish(litellm.model_cost)
 
 
 class TestParallelAISearch:

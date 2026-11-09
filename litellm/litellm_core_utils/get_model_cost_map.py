@@ -9,13 +9,15 @@ export LITELLM_LOCAL_MODEL_COST_MAP=True
 ```
 
 The document, the integrity checks, the ``register_model`` overlay and the fetch itself live in Rust behind
-``NativeModelCostMap``. This module decides when to fetch and install, and owns ``litellm.model_cost``.
+``NativeModelCostMap``. This module decides when to fetch and install. ``litellm.rust_bridge.host.model_cost`` owns
+``litellm.model_cost`` and every write to it.
 """
 
 import json
 import os
 import sys
 import threading
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -45,6 +47,10 @@ from litellm.rust_bridge._native import (
     NativeInstalled,
     NativeModelCostMap,
     NativeRejected,
+)
+from litellm.rust_bridge.host import model_cost as model_cost_host
+from litellm.rust_bridge.host.model_cost import (
+    AliasedCostEntry as AliasedCostEntry,  # noqa: PLC0414  # main exported the row type from here
 )
 
 _CLI_ENTRYPOINT_NAMES: Final = frozenset({"lite", "litellm-proxy"})
@@ -108,6 +114,70 @@ class GetModelCostMap:
         """Every field name that at least one entry of the loaded catalog carries."""
         return _loaded_snapshot(model_cost_inputs.provenance.revision).fields
 
+    @staticmethod
+    def get_backup_model_count() -> int:
+        """The number of models in the bundled document."""
+        return _bundled_model_count()
+
+    _get_backup_model_count = get_backup_model_count
+
+    @staticmethod
+    def _check_is_valid_dict(fetched_map: object) -> bool:
+        if not isinstance(fetched_map, dict) or not fetched_map:
+            verbose_logger.warning("LiteLLM: Fetched model cost map is not a non-empty dict.")
+            return False
+        return True
+
+    @staticmethod
+    def _check_model_count_not_reduced(
+        fetched_map: Mapping[str, object],
+        backup_model_count: int,
+        min_model_count: int = MODEL_COST_MAP_MIN_MODEL_COUNT,
+        max_shrink_ratio: float = MODEL_COST_MAP_MAX_SHRINK_RATIO,
+    ) -> bool:
+        fetched_count: Final = _count_model_entries(fetched_map)
+        if fetched_count < min_model_count:
+            verbose_logger.warning(
+                "LiteLLM: Fetched model cost map has only %d models (minimum=%d).", fetched_count, min_model_count
+            )
+            return False
+        if backup_model_count > 0 and fetched_count < backup_model_count * max_shrink_ratio:
+            verbose_logger.warning(
+                "LiteLLM: Fetched model cost map shrank significantly (fetched=%d, backup=%d, threshold=%.0f%%).",
+                fetched_count,
+                backup_model_count,
+                max_shrink_ratio * 100,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def validate_model_cost_map(
+        fetched_map: object,
+        backup_model_count: int,
+        min_model_count: int = MODEL_COST_MAP_MIN_MODEL_COUNT,
+        max_shrink_ratio: float = MODEL_COST_MAP_MAX_SHRINK_RATIO,
+    ) -> bool:
+        """Whether a cost map document passes the integrity limits a fetched one must pass, as main exposed it."""
+        return isinstance(fetched_map, dict) and (
+            GetModelCostMap._check_is_valid_dict(fetched_map)
+            and GetModelCostMap._check_model_count_not_reduced(
+                fetched_map, backup_model_count, min_model_count, max_shrink_ratio
+            )
+        )
+
+
+_RESERVED_TOP_LEVEL_KEYS: Final = frozenset({"sample_spec", "fallback_generalizations"})
+
+
+def _count_model_entries(model_cost: Mapping[str, object]) -> int:
+    return sum(1 for key in model_cost if key not in _RESERVED_TOP_LEVEL_KEYS)
+
+
+@lru_cache(maxsize=1)
+def _bundled_model_count() -> int:
+    return _count_model_entries(GetModelCostMap.load_local_model_cost_map())
+
 
 def mark_litellm_import_complete() -> None:
     _litellm_import_complete.set()
@@ -118,6 +188,19 @@ class ModelCostMapReloaded:
     """A reload that installed a new document as ``litellm.model_cost``."""
 
     model_count: int
+
+    @property
+    def model_cost_map(self) -> dict[str, dict[str, object]]:
+        """The installed document as it was loaded, before registrations, which main's reload result carried."""
+        return {key: dict(row) for key, row in GetModelCostMap.loaded_model_cost_map().items()}
+
+    @property
+    def revision(self) -> str:
+        return model_cost_inputs.provenance.revision
+
+    @property
+    def etag(self) -> str | None:
+        return model_cost_inputs.provenance.etag
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,17 +273,6 @@ def get_model_cost_map_loaded_at() -> "datetime | None":
     return _LastLoad.current.loaded_at
 
 
-class AliasedCostEntry(dict[str, object]):
-    __slots__ = ("names", "registered_fields")
-
-    def __init__(
-        self, entry: Mapping[str, object], names: tuple[str, ...], registered_fields: frozenset[str] = frozenset()
-    ) -> None:
-        super().__init__(entry)
-        self.names: tuple[str, ...] = names
-        self.registered_fields: frozenset[str] = registered_fields
-
-
 def cost_map_source(url: str, http_settings: object | None) -> NativeCostMapSource:
     """``http_settings`` is ``None`` for the environment alone, as main's import-time ``httpx.get`` read it."""
     return NativeCostMapSource(url, http_settings=http_settings)
@@ -231,11 +303,36 @@ def _install(installed: NativeInstalled) -> int:
     import litellm
     from litellm import utils
 
-    litellm.model_cost = _loaded(installed)
-    utils.model_cost_changed()
+    model_cost_host.publish(_loaded(installed))
     litellm.add_known_models(model_cost_map=installed.rows)
     utils.reapply_runtime_model_cost_registrations()
     return installed.model_count
+
+
+def adopt_model_cost_map(new_model_cost_map: dict) -> int:  # mutable-ok: main's signature, the dict goes live
+    """Makes ``new_model_cost_map`` the live ``litellm.model_cost`` as it is, then writes the router rows and every
+    kept registration onto it. Main's helper, kept for its callers. Reloads install documents through
+    ``install_model_cost_map``."""
+    import litellm
+    from litellm import utils
+
+    model_cost_host.publish(new_model_cost_map)
+    litellm.add_known_models(model_cost_map=new_model_cost_map)
+    utils.reapply_runtime_model_cost_registrations()
+    return len(new_model_cost_map)
+
+
+def _finalize_model_cost_map(  # pyright: ignore[reportUnusedFunction]  # main's private name, downstream code calls it
+    model_cost: dict,  # mutable-ok: main's signature, pops the rules block
+) -> dict:
+    """Main's private finalizer, kept for its callers: installs ``model_cost`` as the loaded document and returns the
+    rows ``litellm.model_cost`` serves for it, aliases expanded and the ``fallback_generalizations`` block applied."""
+    match model_cost_inputs.install(json.dumps(model_cost).encode()):
+        case NativeRejected(reason=reason):
+            raise ValueError(reason)
+        case installed:
+            model_cost.pop("fallback_generalizations", None)
+            return _loaded(installed)
 
 
 def install_model_cost_map(body: bytes, etag: str | None = None) -> ModelCostMapReloadResult:
@@ -268,10 +365,22 @@ def _warn_rejected(rejected: NativeRejected, url: str) -> None:
     )
 
 
+def _warn_ignored_fetch_hooks(sleep: object, rng: object, client: object) -> None:
+    if (sleep, rng, client) != (None, None, None):
+        warnings.warn(
+            "The sleep, rng and client arguments of the model cost map fetch are ignored, the fetch runs natively",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
 async def refetch_model_cost_map(
     url: str,
     timeout: int = 5,
     max_attempts: int = MODEL_COST_MAP_FETCH_MAX_ATTEMPTS,
+    sleep: object = None,
+    rng: object = None,
+    client: object = None,
 ) -> ModelCostMapReloadResult:
     """
     Re-fetch the model cost map for a runtime reload, retrying transient HTTP
@@ -279,9 +388,11 @@ async def refetch_model_cost_map(
 
     Unlike ``get_model_cost_map`` this never falls back to the packaged backup:
     on failure it returns ``ModelCostMapReloadUnavailable`` and the map already
-    installed stays.
+    installed stays. ``sleep``, ``rng`` and ``client`` are accepted for callers of main's signature and ignored.
     """
     from litellm.rust_bridge.host.settings import http_settings
+
+    _warn_ignored_fetch_hooks(sleep, rng, client)
 
     if _uses_bundled_map_only():
         _mark_loaded("local", None, True, None, datetime.now(timezone.utc))
@@ -326,7 +437,14 @@ def _retry_remote_fetch_in_background(
         verbose_logger.warning("LiteLLM: Background model cost map retry failed: %s", e)
 
 
-def get_model_cost_map(url: str, timeout: int = 5, max_attempts: int = MODEL_COST_MAP_FETCH_MAX_ATTEMPTS) -> dict:
+def get_model_cost_map(
+    url: str,
+    timeout: int = 5,
+    max_attempts: int = MODEL_COST_MAP_FETCH_MAX_ATTEMPTS,
+    sleep: object = None,
+    rng: object = None,
+    client: object = None,
+) -> dict:
     """
     Public entry point — returns the model cost map dict.
 
@@ -340,6 +458,7 @@ def get_model_cost_map(url: str, timeout: int = 5, max_attempts: int = MODEL_COS
     The fetch runs on a runtime built and shut down inside the call, so a
     process that imports litellm can still fork workers afterwards.
     """
+    _warn_ignored_fetch_hooks(sleep, rng, client)
     started: Final = datetime.now(timezone.utc)
     if _uses_bundled_map_only() or _is_cli_process():
         _mark_loaded("local", None, True, None, started)

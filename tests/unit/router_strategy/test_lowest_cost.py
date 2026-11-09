@@ -7,7 +7,7 @@ import litellm
 from litellm.caching.caching import DualCache
 from litellm.router_strategy.lowest_cost import LowestCostLoggingHandler
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
-from litellm.utils import model_cost_changed
+from litellm.rust_bridge.host.model_cost import publish
 from tests._vcr_conftest_common import install_live_call_probe, record_vcr_outcome
 
 DEPLOYMENT_ID = "9876"
@@ -163,7 +163,7 @@ def isolate_litellm_state():
     for attr, original_value in original_state.items():
         if hasattr(litellm, attr):
             setattr(litellm, attr, original_value)
-    model_cost_changed()
+    publish(litellm.model_cost)
 
 
 _SCALAR_DEFAULTS = {
