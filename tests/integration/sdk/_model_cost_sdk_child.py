@@ -28,6 +28,7 @@ MODEL: Final = "lit-sdk-chat"
 ADDED: Final = "lit-sdk-added"
 FINETUNE: Final = f"ft:{MODEL}:org:custom:id"
 CUSTOM_INPUT: Final = 9e-06
+CUSTOM_OUTPUT: Final = 7e-06
 BASE: Final = os.environ["MODEL_COST_SDK_BASE_URL"]
 DOCUMENT_P2: Final = os.environ["MODEL_COST_SDK_DOCUMENT"]
 
@@ -83,6 +84,12 @@ def partial_registration_follows_reload() -> list[object]:
     return [bill(MODEL), reload("p2.json"), bill(MODEL)]
 
 
+def partial_registrations_merge_and_follow_reload() -> list[object]:
+    litellm.register_model({MODEL: {"input_cost_per_token": CUSTOM_INPUT}})
+    litellm.register_model({MODEL: {"output_cost_per_token": CUSTOM_OUTPUT}})
+    return [bill(MODEL), reload("p2.json"), bill(MODEL)]
+
+
 def finetune_registration_bills_the_same_after_a_reload() -> list[object]:
     litellm.register_model({FINETUNE: {"input_cost_per_token": CUSTOM_INPUT, "litellm_provider": "openai"}})
     before: Final = bill(FINETUNE)
@@ -97,6 +104,12 @@ def finetune_registration_inherits_the_base_prices() -> list[object]:
 def new_row_without_invalidating() -> list[object]:
     litellm.model_cost[ADDED] = row(3.0)
     return [bill(ADDED)]
+
+
+def new_row_after_a_miss_without_invalidating() -> list[object]:
+    before: Final = bill(ADDED)
+    litellm.model_cost[ADDED] = row(3.0)
+    return [before, bill(ADDED)]
 
 
 def new_row_then_invalidate() -> list[object]:
@@ -177,9 +190,11 @@ CASES: Final[dict[str, Callable[[], list[object]]]] = {
         failed_reload_keeps_prices,
         registration_survives_reload,
         partial_registration_follows_reload,
+        partial_registrations_merge_and_follow_reload,
         finetune_registration_bills_the_same_after_a_reload,
         finetune_registration_inherits_the_base_prices,
         new_row_without_invalidating,
+        new_row_after_a_miss_without_invalidating,
         new_row_then_invalidate,
         value_edited_in_place_then_invalidate,
         setdefault_update_then_invalidate,

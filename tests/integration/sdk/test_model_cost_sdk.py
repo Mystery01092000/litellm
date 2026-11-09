@@ -18,6 +18,7 @@ _PROMPT: Final = 1000
 _CACHED: Final = 400
 _COMPLETION: Final = 500
 _CUSTOM_INPUT: Final = 9e-06
+_CUSTOM_OUTPUT: Final = 7e-06
 _CHARGES: Final = TypeAdapter(list[float | bool | None])
 _BUNDLED: Final = TypeAdapter(dict[str, JsonValue]).validate_json(
     files("litellm").joinpath("model_prices_and_context_window_backup.json").read_bytes()
@@ -124,6 +125,10 @@ def _custom_input(rates: _Rates) -> _Rates:
     return _Rates(input=_CUSTOM_INPUT, output=rates.output, cache_read=rates.cache_read)
 
 
+def _custom_input_and_output(rates: _Rates) -> _Rates:
+    return _Rates(input=_CUSTOM_INPUT, output=_CUSTOM_OUTPUT, cache_read=rates.cache_read)
+
+
 def _charged(rates: _Rates) -> object:
     return pytest.approx(rates.cost(), rel=1e-9)
 
@@ -144,11 +149,16 @@ _FINETUNE_BUG: Final = pytest.mark.xfail(
         ("failed_reload_keeps_prices", [_charged(_P1), False, _charged(_P1)]),
         ("registration_survives_reload", [_charged(_P3), _charged(_P3), True, _charged(_P3), None]),
         ("partial_registration_follows_reload", [_charged(_custom_input(_P1)), True, _charged(_custom_input(_P2))]),
+        (
+            "partial_registrations_merge_and_follow_reload",
+            [_charged(_custom_input_and_output(_P1)), True, _charged(_custom_input_and_output(_P2))],
+        ),
         ("finetune_registration_bills_the_same_after_a_reload", [True, True, True]),
         pytest.param(
             "finetune_registration_inherits_the_base_prices", [_charged(_custom_input(_P1))], marks=_FINETUNE_BUG
         ),
         ("new_row_without_invalidating", [_charged(_P3)]),
+        ("new_row_after_a_miss_without_invalidating", [None, _charged(_P3)]),
         ("new_row_then_invalidate", [None, _charged(_P3)]),
         ("value_edited_in_place_then_invalidate", [_charged(_P1), _charged(_custom_input(_P1))]),
         ("setdefault_update_then_invalidate", [_charged(_P1), _charged(_custom_input(_P1))]),

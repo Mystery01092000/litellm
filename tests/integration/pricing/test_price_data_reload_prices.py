@@ -93,6 +93,7 @@ _CATALOG: Final[Mapping[str, Mapping[str, JsonValue]]] = MappingProxyType(
 @dataclass(frozen=True, slots=True)
 class _Published:
     scale: float
+    added: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,8 +148,9 @@ class _Charge:
     expected: float
 
 
-def _catalog(scale: float) -> dict[str, JsonValue]:
+def _catalog(scale: float, added: tuple[str, ...] = ()) -> dict[str, JsonValue]:
     return {
+        **{model: {"litellm_provider": "openai", "mode": "chat"} for model in added},
         **{
             model: {name: value * scale if isinstance(value, float) else value for name, value in row.items()}
             for model, row in _CATALOG.items()
@@ -308,8 +310,8 @@ def _reply(request: Request) -> Reply:
 
 def _cost_map_reply(served: _Served) -> Reply:
     match served:
-        case _Published(scale=scale):
-            return Reply(body=json.dumps(_catalog(scale)).encode())
+        case _Published(scale=scale, added=added):
+            return Reply(body=json.dumps(_catalog(scale, added)).encode())
         case _Failing(status=status):
             return Reply(status=status, body=b"{}")
 
@@ -648,3 +650,40 @@ def test_a_model_added_through_the_api_keeps_its_prices_and_inherits_the_reloade
         )
         for charge in (*before, *after):
             assert _spend(charge.request_id) == pytest.approx(charge.expected, rel=1e-6)
+
+
+_WILDCARD: Final = _Deployment("openai/*", "openai/*", {}, _Usage(1000, 0, 500), _unpriced)
+_LISTED_AFTER_RELOAD: Final = "gpt-audit-reload-listed"
+
+
+def _listed_models(proxy: Gateway) -> list[str]:
+    data: Final = proxy.get("/v1/models")["data"]
+    assert isinstance(data, list), data
+    return [string_value(object_value(entry)["id"]) for entry in data]
+
+
+def _deployment_ids(proxy: Gateway) -> list[str]:
+    entries: Final = proxy.get("/model/info")["data"]
+    assert isinstance(entries, list), entries
+    return [string_value(object_value(object_value(entry)["model_info"])["id"]) for entry in entries]
+
+
+@pytest.mark.timeout(2 * graceful_stop_seconds() + 180)
+def test_a_wildcard_lists_the_models_a_reload_adds_and_never_a_deployment_id(gateway: Gateway, tmp_path: Path) -> None:
+    custom: Final = _Deployment("listed-custom", f"openai/{_MINI}", _CUSTOM, _Usage(1000, 0, 500), _custom_rates)
+    server: Final = _CostMapServer()
+    with (
+        wire_server(_responder(server)) as wire,
+        _lifecycle_proxy(gateway, tmp_path, wire.url, (_WILDCARD, custom)) as owned,
+    ):
+        proxy: Final = owned.gateway
+        _charged_as_listed(proxy, custom, 1.0)
+        assert f"openai/{_LISTED_AFTER_RELOAD}" not in _listed_models(proxy)
+        server.serving = _Published(1.0, added=(_LISTED_AFTER_RELOAD,))
+        reload: Final = _reload(proxy)
+        assert reload.status_code == 200, reload.text
+        _charged_as_listed(proxy, custom, 1.0)
+        listed: Final = _listed_models(proxy)
+        deployment_ids: Final = _deployment_ids(proxy)
+        assert f"openai/{_LISTED_AFTER_RELOAD}" in listed, listed
+        assert [model for model in listed if any(id_ in model for id_ in deployment_ids)] == [], listed

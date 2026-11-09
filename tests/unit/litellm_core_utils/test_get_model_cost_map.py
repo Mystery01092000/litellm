@@ -719,7 +719,64 @@ def test_registrations_survive_a_reload_in_call_order():
 
     assert litellm.model_cost["lit-registered"]["input_cost_per_token"] == 2
     assert litellm.model_cost["lit-registered"]["output_cost_per_token"] == 3
+    assert litellm.model_cost["lit-registered"]["mode"] == "chat"
     assert litellm.get_model_info("lit-registered")["input_cost_per_token"] == 2
+
+
+@pytest.mark.usefixtures("own_model_cost")
+def test_the_latest_registration_of_a_row_wins_in_the_registered_catalog_and_after_a_reload():
+    litellm.register_model({"gpt-4o": {"input_cost_per_token": 1.0}})
+    litellm.register_model({"openai/gpt-4o": {"input_cost_per_token": 2.0}})
+    assert catalog_with_runtime_registrations()["gpt-4o"]["input_cost_per_token"] == 2.0
+
+    litellm.register_model({"gpt-4o": {"input_cost_per_token": 3.0}})
+    install_model_cost_map(_BUNDLED)
+
+    assert litellm.model_cost["gpt-4o"]["input_cost_per_token"] == 3.0
+    assert catalog_with_runtime_registrations()["gpt-4o"]["input_cost_per_token"] == 3.0
+
+
+@pytest.mark.usefixtures("own_model_cost")
+def test_a_registration_moves_to_the_row_a_reload_adds_for_it():
+    litellm.register_model({"openai/lit-arrives": {"litellm_provider": "openai", "input_cost_per_token": 5.0}})
+
+    install_model_cost_map(_document_with(**{"lit-arrives": {"litellm_provider": "openai", "mode": "chat"}}))
+
+    assert litellm.model_cost["lit-arrives"]["input_cost_per_token"] == 5.0
+    assert catalog_with_runtime_registrations()["lit-arrives"]["input_cost_per_token"] == 5.0
+
+
+@pytest.mark.usefixtures("own_model_cost")
+def test_a_reload_counts_the_rows_it_serves_and_not_the_registrations():
+    litellm.register_model({"lit-only-registered": {"litellm_provider": "openai", "mode": "chat"}})
+
+    result: Final = install_model_cost_map(_BUNDLED)
+
+    assert isinstance(result, ModelCostMapReloaded)
+    assert result.model_count == len(GetModelCostMap.loaded_model_cost_map()) == len(litellm.model_cost) - 1
+
+
+@pytest.mark.usefixtures("own_model_cost")
+def test_a_reload_adds_the_models_it_serves_to_the_provider_sets():
+    install_model_cost_map(_document_with(**{"lit-reloaded-chat": {"litellm_provider": "openai", "mode": "chat"}}))
+
+    assert "lit-reloaded-chat" in litellm.models_by_provider["openai"]
+
+
+@pytest.mark.usefixtures("own_model_cost")
+def test_a_reload_repeats_the_cache_pricing_warning_for_a_registration_no_catalog_row_matches(
+    caplog: pytest.LogCaptureFixture,
+):
+    litellm.register_model({"lit-unmatched": {"litellm_provider": "openai", "input_cost_per_token": 1e-06}})
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger=litellm.verbose_logger.name):
+        install_model_cost_map(_BUNDLED)
+
+    assert any(
+        "lit-unmatched" in record.message and "cache_creation_input_token_cost" in record.message
+        for record in caplog.records
+    ), caplog.text
 
 
 @pytest.mark.usefixtures("own_model_cost")
@@ -816,13 +873,21 @@ def test_the_loaded_catalog_follows_installs_and_ignores_registrations():
 
 @pytest.mark.usefixtures("own_model_cost")
 @pytest.mark.parametrize("add_to_provider_model_sets", [True, False])
-def test_register_model_adds_names_to_the_provider_sets_only_when_asked(add_to_provider_model_sets: bool):
+def test_register_model_adds_names_to_the_provider_sets_only_when_asked_and_a_reload_keeps_it_so(
+    add_to_provider_model_sets: bool,
+):
+    chat_model: Final = f"lit-registered-chat-{add_to_provider_model_sets}".lower()
     litellm.register_model(
-        {"openrouter/lit-vendor/lit-model": {"litellm_provider": "openrouter", "mode": "chat"}},
+        {
+            "openrouter/lit-vendor/lit-model": {"litellm_provider": "openrouter", "mode": "chat"},
+            chat_model: {"litellm_provider": "openai", "mode": "chat"},
+        },
         add_to_provider_model_sets=add_to_provider_model_sets,
     )
+    install_model_cost_map(_BUNDLED)
 
     assert ("lit-vendor/lit-model" in litellm.openrouter_models) is add_to_provider_model_sets
+    assert (chat_model in litellm.models_by_provider["openai"]) is add_to_provider_model_sets
 
 
 @pytest.mark.usefixtures("own_model_cost")
@@ -852,6 +917,12 @@ def test_alias_names_share_one_entry_after_an_install_and_a_registration():
     assert entry.registered_fields == frozenset({"input_cost_per_token"})
     assert runtime_model_cost_registrations("lit-owner", "openai") == (("lit-owner", {"input_cost_per_token": 3e-06}),)
 
+    litellm.register_model({"lit-owner": {"output_cost_per_token": 4e-06}})
+
+    assert runtime_model_cost_registrations("lit-owner", "openai") == (
+        ("lit-owner", {"input_cost_per_token": 3e-06, "output_cost_per_token": 4e-06}),
+    )
+
 
 @pytest.mark.usefixtures("remote_source", "own_model_cost")
 def test_register_model_from_a_url_registers_the_served_rows_without_the_fallback_rules():
@@ -877,6 +948,14 @@ def test_register_model_from_a_url_that_fails_registers_nothing(reply: _Reply):
         litellm.register_model(server.url)
 
     assert model_cost_inputs.registered_keys() == list(GetModelCostMap.loaded_model_cost_map())
+
+
+def test_without_registrations_the_registered_catalog_is_the_loaded_catalog():
+    catalog: Final = catalog_with_runtime_registrations()
+
+    assert {key: dict(row) for key, row in catalog.items()} == {
+        key: dict(row) for key, row in GetModelCostMap.loaded_model_cost_map().items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -961,8 +1040,8 @@ def test_a_key_swapped_in_for_a_popped_one_replaces_it_in_lookups():
     rows.pop("Lit-Gone")
     rows["Lit-New"] = {"litellm_provider": "p"}
 
-    assert instance.find_key(rows, "lit-gone") is None
     assert instance.find_key(rows, "lit-new") == "Lit-New"
+    assert instance.find_key(rows, "lit-gone") is None
 
 
 def test_a_rebound_dict_is_what_lookups_read_next():
@@ -982,9 +1061,8 @@ def test_case_insensitive_lookups_go_through_the_live_dict(monkeypatch: pytest.M
 
 
 def test_main_cost_map_names_downstream_code_calls_stay_callable_with_their_main_signatures():
-    # Not an API we would design today. Downstream SDK code calls these names from main directly (open-arena, pflow,
-    # preloop, Skyvern, benchflow, EpicStaff, autorubric, ai-shifu, vscode-graph-agent, ccrelay, Raven), so removing
-    # one breaks it. Their behavior is pinned in tests/integration/sdk/test_model_cost_sdk.py
+    # Not an API we would design today. Downstream open source SDK code calls these names from main directly, so
+    # removing one breaks it. Their behavior is pinned in tests/integration/sdk/test_model_cost_sdk.py
     import inspect
 
     from litellm.litellm_core_utils import get_model_cost_map as cost_map_module
@@ -1014,3 +1092,21 @@ def test_main_cost_map_names_downstream_code_calls_stay_callable_with_their_main
         inspect.signature(function).bind(**arguments)
     assert {"model_cost_map", "revision", "etag"} <= set(dir(ModelCostMapReloaded))
     assert issubclass(AliasedCostEntry, dict)
+
+
+@pytest.mark.usefixtures("own_model_cost")
+def test_main_cost_map_helpers_keep_their_side_effects(monkeypatch: pytest.MonkeyPatch):
+    from litellm.litellm_core_utils.get_model_cost_map import (
+        _finalize_model_cost_map,  # pyright: ignore[reportPrivateUsage]  # downstream code calls main's finalizer
+    )
+
+    document: Final = json.loads(_BUNDLED)
+    assert FALLBACK_GENERALIZATIONS_KEY in document
+
+    rows: Final = _finalize_model_cost_map(document)
+
+    assert FALLBACK_GENERALIZATIONS_KEY not in document
+    assert FALLBACK_GENERALIZATIONS_KEY not in rows
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    with pytest.warns(DeprecationWarning, match="ignored"):
+        asyncio.run(refetch_model_cost_map(url="http://127.0.0.1:9/unused.json", sleep=asyncio.sleep))
