@@ -415,6 +415,20 @@ def test_price_data_reload_reprices_catalog_deployments_and_keeps_custom_prices(
 
 
 @pytest.mark.timeout(2 * graceful_stop_seconds() + 120)
+def test_custom_prices_on_one_deployment_never_reach_a_sibling_on_the_same_backend_across_a_reload(
+    gateway: Gateway, tmp_path: Path
+) -> None:
+    _assert_priced_across_a_reload(
+        gateway,
+        tmp_path,
+        (
+            _Deployment("mini-custom", f"openai/{_MINI}", _CUSTOM, _Usage(1000, 0, 500), _custom_rates),
+            _Deployment("mini-catalog", f"openai/{_MINI}", {}, _Usage(1000, 0, 500), _catalog_rates(_MINI)),
+        ),
+    )
+
+
+@pytest.mark.timeout(2 * graceful_stop_seconds() + 120)
 @pytest.mark.parametrize(
     "deployment",
     (

@@ -25,6 +25,7 @@ from litellm.utils import (
 )
 
 MODEL: Final = "lit-sdk-chat"
+ALIAS: Final = "lit-sdk-chat-alias"
 ADDED: Final = "lit-sdk-added"
 FINETUNE: Final = f"ft:{MODEL}:org:custom:id"
 CUSTOM_INPUT: Final = 9e-06
@@ -70,6 +71,17 @@ def reload_reprices() -> list[object]:
 
 def failed_reload_keeps_prices() -> list[object]:
     return [bill(MODEL), reload("missing.json"), bill(MODEL)]
+
+
+def billed_and_listed(model: str) -> list[object]:
+    info: Final = litellm.get_model_info(f"openai/{model}")
+    return [bill(model), info["input_cost_per_token"], info["output_cost_per_token"]]
+
+
+def every_name_bills_and_lists_the_row_across_a_reload() -> list[object]:
+    names: Final = (MODEL, ALIAS, MODEL.upper())
+    before: Final = [value for name in names for value in billed_and_listed(name)]
+    return [*before, reload("p2.json"), *(value for name in names for value in billed_and_listed(name))]
 
 
 def registration_survives_reload() -> list[object]:
@@ -188,6 +200,7 @@ CASES: Final[dict[str, Callable[[], list[object]]]] = {
     for case in (
         reload_reprices,
         failed_reload_keeps_prices,
+        every_name_bills_and_lists_the_row_across_a_reload,
         registration_survives_reload,
         partial_registration_follows_reload,
         partial_registrations_merge_and_follow_reload,

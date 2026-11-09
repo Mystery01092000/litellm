@@ -14,6 +14,7 @@ from integration._support.wire import Reply, Request, Wire, wire_server
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 
 _MODEL: Final = "lit-sdk-chat"
+_ALIAS: Final = "lit-sdk-chat-alias"
 _PROMPT: Final = 1000
 _CACHED: Final = 400
 _COMPLETION: Final = 500
@@ -54,6 +55,7 @@ def _document(scale: float) -> bytes:
         {
             **_BUNDLED,
             _MODEL: {
+                "aliases": [_ALIAS],
                 "litellm_provider": "openai",
                 "mode": "chat",
                 "input_cost_per_token": rates.input,
@@ -133,6 +135,10 @@ def _charged(rates: _Rates) -> object:
     return pytest.approx(rates.cost(), rel=1e-9)
 
 
+def _billed_and_listed(rates: _Rates) -> list[object]:
+    return [_charged(rates), pytest.approx(rates.input, rel=1e-9), pytest.approx(rates.output, rel=1e-9)] * 3
+
+
 _P1: Final = _catalog(1.0)
 _P2: Final = _catalog(2.0)
 _P3: Final = _catalog(3.0)
@@ -147,6 +153,10 @@ _FINETUNE_BUG: Final = pytest.mark.xfail(
     [
         ("reload_reprices", [_charged(_P1), True, _charged(_P2)]),
         ("failed_reload_keeps_prices", [_charged(_P1), False, _charged(_P1)]),
+        (
+            "every_name_bills_and_lists_the_row_across_a_reload",
+            [*_billed_and_listed(_P1), True, *_billed_and_listed(_P2)],
+        ),
         ("registration_survives_reload", [_charged(_P3), _charged(_P3), True, _charged(_P3), None]),
         ("partial_registration_follows_reload", [_charged(_custom_input(_P1)), True, _charged(_custom_input(_P2))]),
         (
