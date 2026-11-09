@@ -644,24 +644,35 @@ _UNREACHABLE_ENDPOINT: Final = "http://127.0.0.1:9"
         ({"AWS_DEFAULT_REGION": "sa-east-1"}, "AWS_ENDPOINT_URL_S3", "sa-east-1"),
         ({"AWS_ENDPOINT_URL": _UNREACHABLE_ENDPOINT}, "AWS_ENDPOINT_URL_S3", "us-east-1"),
         ({}, "AWS_ENDPOINT_URL", "us-east-1"),
+        ({"AWS_CONFIG_FILE": "profile_region"}, "AWS_ENDPOINT_URL_S3", "eu-north-1"),
     ],
 )
 def test_an_s3_load_signs_for_the_region_and_reaches_the_endpoint_the_environment_names(
-    monkeypatch: pytest.MonkeyPatch, environment: Mapping[str, str], endpoint_variable: str, region: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    environment: Mapping[str, str],
+    endpoint_variable: str,
+    region: str,
 ):
     for name in (
         "AWS_REGION_NAME",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
+        "AWS_PROFILE",
         "AWS_SESSION_TOKEN",
         "AWS_ENDPOINT_URL_S3",
         "AWS_ENDPOINT_URL",
     ):
         monkeypatch.delenv(name, raising=False)
+    profile: Final = tmp_path / "profile_region"
+    profile.write_text("[default]\nregion = eu-north-1\n")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "no_config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "no_credentials"))
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDMODELCOST")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "model-cost-secret")
     for name, value in environment.items():
-        monkeypatch.setenv(name, value)
+        monkeypatch.setenv(name, str(tmp_path / value) if name == "AWS_CONFIG_FILE" else value)
     with _serving(_Reply()) as server:
         monkeypatch.setenv(endpoint_variable, server.url.removesuffix("/cost.json"))
         litellm.get_model_cost_map(url="s3://lit-prices/maps/cost.json", max_attempts=1)

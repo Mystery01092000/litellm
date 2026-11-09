@@ -1,28 +1,20 @@
-use std::sync::LazyLock;
 use std::time::Duration;
 
-use litellm_auth_aws::{AwsAuthService, AwsCredentialsProvider};
 use litellm_http::{ClientVariant, HttpClientConfig};
-use litellm_model_catalog_refresh::{Failed, Fetched, RetryPolicy, Start, Target};
+use litellm_model_catalog_refresh::{Failed, Fetched, RetryPolicy, S3Access, Start};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-static AWS: LazyLock<AwsAuthService> = LazyLock::new(AwsAuthService::default);
-
-/// The default chain main's `boto3.client("s3")` read its credentials from
-fn default_chain(auth: AwsAuthService, target: &Target) -> AwsCredentialsProvider {
-    AwsCredentialsProvider::default_chain(auth, target.aws_region.clone())
-}
-
-/// Where to fetch the cost map from and how to connect, built by Python from env and `litellm.*`
+/// A cost map URL and how to connect to it. An `s3://` URL reaches S3 as an AWS SDK finds it in the environment,
+/// with LiteLLM's `AWS_REGION_NAME` winning over the region it finds
 #[pyclass(
     frozen,
     name = "NativeCostMapSource",
     module = "litellm.rust_bridge._native"
 )]
 pub(crate) struct NativeCostMapSource {
-    target: Target,
+    url: String,
     http: HttpClientConfig,
 }
 
@@ -30,22 +22,67 @@ pub(crate) struct NativeCostMapSource {
 impl NativeCostMapSource {
     /// `http_settings` is `litellm.rust_bridge.host.settings.http_settings()`, or `None` for the environment alone
     #[new]
-    #[pyo3(signature = (url, *, http_settings, aws_region, aws_endpoint_url = None))]
-    fn new(
-        py: Python<'_>,
-        url: String,
-        http_settings: Option<Bound<'_, PyAny>>,
-        aws_region: String,
-        aws_endpoint_url: Option<String>,
-    ) -> PyResult<Self> {
+    #[pyo3(signature = (url, *, http_settings))]
+    fn new(py: Python<'_>, url: String, http_settings: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
         Ok(Self {
-            target: Target {
-                url,
-                aws_region,
-                aws_endpoint_url,
-            },
+            url,
             http: crate::http::settings_config(py, http_settings.as_ref())?,
         })
+    }
+
+    /// Fetches on the shared runtime with a pooled client. For callers inside a worker, after any fork
+    fn fetch<'py>(
+        &self,
+        py: Python<'py>,
+        policy: PyRef<'_, NativeFetchPolicy>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = crate::http::pool()
+            .client(&self.http, ClientVariant::Provider)
+            .map_err(crate::http::client_error)?;
+        let url = self.url.clone();
+        let policy = policy.0;
+        crate::execution::run_async_value(py, async move {
+            Ok(Outcome(
+                litellm_model_catalog_refresh::fetch(&client, &s3(), &url, policy, Start::Fresh)
+                    .await,
+            ))
+        })
+    }
+
+    /// Fetches on a throwaway runtime with a client of its own, so a process that fetches here can still fork.
+    /// `resume_from` continues a fetch whose first attempt failed retryably
+    #[pyo3(signature = (policy, resume_from = None))]
+    fn fetch_blocking(
+        &self,
+        py: Python<'_>,
+        policy: PyRef<'_, NativeFetchPolicy>,
+        resume_from: Option<PyRef<'_, NativeFetchFailed>>,
+    ) -> PyResult<Py<PyAny>> {
+        let start = resume_from.map_or(Start::Fresh, |failed| Start::After(failed.0.clone()));
+        let (config, url, policy) = (self.http.clone(), self.url.clone(), policy.0);
+        let logger = crate::logger::capture(py);
+        let fetched = litellm_host_python::release_gil(py, move || {
+            logger.scope(|| {
+                let client = crate::http::pool()
+                    .unpooled(&config, ClientVariant::Provider)
+                    .map_err(crate::http::client_error)?;
+                litellm_host_python::run_isolated(litellm_model_catalog_refresh::fetch(
+                    &client,
+                    &s3(),
+                    &url,
+                    policy,
+                    start,
+                ))
+                .map_err(PyErr::from)
+            })
+        })?;
+        Outcome(fetched).into_pyobject(py).map(Bound::unbind)
+    }
+}
+
+fn s3() -> S3Access {
+    S3Access::Environment {
+        region: std::env::var("AWS_REGION_NAME").ok(),
     }
 }
 
@@ -122,60 +159,6 @@ impl NativeFetchFailed {
 
 struct Outcome(Result<Fetched, Failed>);
 
-/// Fetches on the shared runtime with a pooled client. For callers inside a worker, after any fork
-pub(crate) fn fetch<'py>(
-    py: Python<'py>,
-    source: &NativeCostMapSource,
-    policy: &NativeFetchPolicy,
-) -> PyResult<Bound<'py, PyAny>> {
-    let client = crate::http::pool()
-        .client(&source.http, ClientVariant::Provider)
-        .map_err(crate::http::client_error)?;
-    let target = source.target.clone();
-    let credentials = default_chain(AWS.clone(), &target);
-    let policy = policy.0;
-    crate::execution::run_async_value(py, async move {
-        let fetched = litellm_model_catalog_refresh::fetch(
-            &client,
-            &credentials,
-            &target,
-            policy,
-            Start::Fresh,
-        )
-        .await;
-        Ok(Outcome(fetched))
-    })
-}
-
-/// Fetches on a throwaway runtime with a client and AWS credential cache of its own, so a process that fetches here
-/// can still fork. `resume_from` continues a fetch whose first attempt failed retryably
-pub(crate) fn fetch_blocking(
-    py: Python<'_>,
-    source: &NativeCostMapSource,
-    policy: &NativeFetchPolicy,
-    resume_from: Option<&NativeFetchFailed>,
-) -> PyResult<Py<PyAny>> {
-    let start = resume_from.map_or(Start::Fresh, |failed| Start::After(failed.0.clone()));
-    let config = source.http.clone();
-    let target = source.target.clone();
-    let policy = policy.0;
-    let logger = crate::logger::capture(py);
-    let fetched = litellm_host_python::release_gil(py, move || {
-        logger.scope(|| {
-            let client = crate::http::pool()
-                .unpooled(&config, ClientVariant::Provider)
-                .map_err(crate::http::client_error)?;
-            litellm_host_python::run_isolated(async move {
-                let credentials = default_chain(AwsAuthService::default(), &target);
-                litellm_model_catalog_refresh::fetch(&client, &credentials, &target, policy, start)
-                    .await
-            })
-            .map_err(PyErr::from)
-        })
-    })?;
-    Outcome(fetched).into_pyobject(py).map(Bound::unbind)
-}
-
 impl<'py> IntoPyObject<'py> for Outcome {
     type Target = PyAny;
     type Output = Bound<'py, PyAny>;
@@ -222,9 +205,10 @@ mod tests {
         });
         Python::initialize();
         Python::attach(|py| {
-            let source = NativeCostMapSource::new(py, url, None, "us-east-1".into(), None).unwrap();
-            let policy = NativeFetchPolicy::new(3, 30.0, 5.0, 2.0).unwrap();
-            let outcome = fetch_blocking(py, &source, &policy, None).unwrap();
+            let source = NativeCostMapSource::new(py, url, None).unwrap();
+            let policy =
+                Bound::new(py, NativeFetchPolicy::new(3, 30.0, 5.0, 2.0).unwrap()).unwrap();
+            let outcome = source.fetch_blocking(py, policy.borrow(), None).unwrap();
             let fetched = outcome.bind(py).cast::<NativeFetched>().unwrap().get();
             assert_eq!(fetched.body.bind(py).as_bytes(), b"{}");
             assert_eq!(fetched.etag.as_deref(), Some("\"v1\""));

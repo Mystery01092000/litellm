@@ -203,15 +203,7 @@ class AliasedCostEntry(dict[str, object]):
 
 def cost_map_source(url: str, http_settings: object | None) -> NativeCostMapSource:
     """``http_settings`` is ``None`` for the environment alone, as main's import-time ``httpx.get`` read it."""
-    return NativeCostMapSource(
-        url,
-        http_settings=http_settings,
-        aws_region=os.getenv("AWS_REGION_NAME")
-        or os.getenv("AWS_REGION")
-        or os.getenv("AWS_DEFAULT_REGION")
-        or "us-east-1",
-        aws_endpoint_url=os.getenv("AWS_ENDPOINT_URL_S3") or os.getenv("AWS_ENDPOINT_URL"),
-    )
+    return NativeCostMapSource(url, http_settings=http_settings)
 
 
 def fetch_policy(timeout: float, max_attempts: int) -> NativeFetchPolicy:
@@ -295,9 +287,7 @@ async def refetch_model_cost_map(
         _mark_loaded("local", None, True, None, datetime.now(timezone.utc))
         return ModelCostMapReloaded(model_count=_install(model_cost_inputs.install_bundled()))
 
-    fetched: Final = await model_cost_inputs.fetch(
-        cost_map_source(url, http_settings()), fetch_policy(timeout, max_attempts)
-    )
+    fetched: Final = await cost_map_source(url, http_settings()).fetch(fetch_policy(timeout, max_attempts))
     if isinstance(fetched, NativeFetchFailed):
         verbose_logger.warning(
             "LiteLLM: model cost map reload failed: %s. Keeping the currently loaded map.", fetched.reason
@@ -317,9 +307,7 @@ def _retry_remote_fetch_in_background(
     url: str, timeout: int, max_attempts: int, first_failure: NativeFetchFailed
 ) -> None:
     try:
-        fetched: Final = model_cost_inputs.fetch_blocking(
-            cost_map_source(url, None), fetch_policy(timeout, max_attempts), first_failure
-        )
+        fetched: Final = cost_map_source(url, None).fetch_blocking(fetch_policy(timeout, max_attempts), first_failure)
         if isinstance(fetched, NativeFetchFailed):
             verbose_logger.warning(
                 "LiteLLM: Failed to fetch remote model cost map from %s after %d attempts; keeping local backup",
@@ -357,7 +345,7 @@ def get_model_cost_map(url: str, timeout: int = 5, max_attempts: int = MODEL_COS
         _mark_loaded("local", None, True, None, started)
         return _loaded(model_cost_inputs.install_bundled())
 
-    fetched: Final = model_cost_inputs.fetch_blocking(cost_map_source(url, None), fetch_policy(timeout, 1))
+    fetched: Final = cost_map_source(url, None).fetch_blocking(fetch_policy(timeout, 1))
     if isinstance(fetched, NativeFetchFailed):
         if fetched.retryable and max_attempts > 1:
             threading.Thread(
@@ -391,7 +379,7 @@ def get_model_cost_map(url: str, timeout: int = 5, max_attempts: int = MODEL_COS
 
 def fetch_registration_document(url: str) -> dict[str, dict[str, object]] | None:
     """The document behind ``register_model(url)``, fetched in one attempt, or ``None`` when the fetch failed."""
-    fetched: Final = model_cost_inputs.fetch_blocking(cost_map_source(url, None), fetch_policy(5, 1))
+    fetched: Final = cost_map_source(url, None).fetch_blocking(fetch_policy(5, 1))
     if isinstance(fetched, NativeFetchFailed):
         verbose_logger.warning("LiteLLM: register_model could not fetch %s: %s", url, fetched.reason)
         return None
