@@ -198,7 +198,7 @@ impl NativeModelCostMap {
             .map(|(key, kept)| (key.to_owned(), kept.bind(py).clone().into_any()))
             .collect();
         let pass = self.write_pass(rows, &entries, None)?;
-        self.keep(Vec::new(), pass.landed());
+        self.write_inputs().registrations.record(pass.landed());
         into_py(py, pass)
     }
 
@@ -212,7 +212,7 @@ impl NativeModelCostMap {
             let inputs = self.read_inputs();
             let applied: Vec<Bound<'py, PyDict>> = inputs
                 .registrations
-                .over(&[key])
+                .over(key)
                 .into_iter()
                 .map(|kept| kept.bind(py).clone())
                 .collect();
@@ -365,28 +365,19 @@ struct PublishedTable<'a, 'py> {
 
 impl<'py> RegistrationTable for PublishedTable<'_, 'py> {
     type Registration = Bound<'py, PyAny>;
-    type Landing = host::Landing<'py>;
     type Error = PyErr;
 
-    fn resolve(
-        &mut self,
-        key: &str,
-        registration: &Self::Registration,
-    ) -> PyResult<Option<Self::Landing>> {
-        host::resolve(self.rows, key, registration, self.custom_llm_provider)
-    }
-
-    fn write(
-        &mut self,
-        landing: Self::Landing,
-        registration: &Self::Registration,
-    ) -> PyResult<Placed> {
+    fn place(&mut self, key: &str, registration: &Self::Registration) -> PyResult<Option<Placed>> {
+        let Some(landing) = host::resolve(self.rows, key, registration, self.custom_llm_provider)?
+        else {
+            return Ok(None);
+        };
         table::write(self.rows, &landing, registration)?;
         self.map.invalidate();
-        Ok(Placed {
+        Ok(Some(Placed {
             key: landing.key,
             matched_builtin: landing.matched_builtin,
-        })
+        }))
     }
 }
 

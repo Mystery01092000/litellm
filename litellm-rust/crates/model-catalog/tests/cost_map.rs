@@ -41,7 +41,9 @@ fn provenance_is_the_read_bytes_and_etag() {
 }
 
 #[rstest]
-fn every_name_of_an_aliased_row_lists_its_owner_first() {
+fn every_name_of_an_aliased_row_lists_its_owner_first(
+    #[values("owner", "short", "owner-latest")] key: &str,
+) {
     let body = json!({
         "owner": {"litellm_provider": "p", "aliases": ["short"]},
         "owner-latest": {"alias_of": "owner"},
@@ -49,8 +51,6 @@ fn every_name_of_an_aliased_row_lists_its_owner_first() {
     })
     .to_string();
     let cost_map = CostMap::read(body.as_bytes(), None, any_size()).unwrap();
-    for key in ["owner", "short", "owner-latest"] {
-        assert_eq!(cost_map.names(key), ["owner", "short", "owner-latest"]);
-    }
+    assert_eq!(cost_map.names(key), ["owner", "short", "owner-latest"]);
     assert!(cost_map.names("plain").is_empty());
 }

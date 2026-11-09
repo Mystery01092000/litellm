@@ -167,18 +167,6 @@ class GetModelCostMap:
         )
 
 
-_RESERVED_TOP_LEVEL_KEYS: Final = frozenset({"sample_spec", "fallback_generalizations"})
-
-
-def _count_model_entries(model_cost: Mapping[str, object]) -> int:
-    return sum(1 for key in model_cost if key not in _RESERVED_TOP_LEVEL_KEYS)
-
-
-@lru_cache(maxsize=1)
-def _bundled_model_count() -> int:
-    return _count_model_entries(GetModelCostMap.load_local_model_cost_map())
-
-
 def mark_litellm_import_complete() -> None:
     _litellm_import_complete.set()
 
@@ -291,28 +279,16 @@ def _set_fallback_rules(block: JsonValue) -> None:
     set_fallback_generalizations(rules if isinstance(rules, list) else None)
 
 
-def _loaded(installed: NativeInstalled) -> dict:
+def _rows_with_rules_set(installed: NativeInstalled) -> dict:
+    """The installed document's rows, after making its ``fallback_generalizations`` rules the active ones."""
     _set_fallback_rules(installed.fallback_generalizations)
     return installed.rows
 
 
-def _install(installed: NativeInstalled) -> int:
-    """Publishes an installed document as ``litellm.model_cost``, then writes the router rows and every kept
-    ``register_model`` call onto it in that order, as on main. Registrations are written after publishing because
-    where each one lands is a lookup in the published table."""
-    import litellm
-    from litellm import utils
-
-    model_cost_host.publish(_loaded(installed))
-    litellm.add_known_models(model_cost_map=installed.rows)
-    utils.reapply_runtime_model_cost_registrations()
-    return installed.model_count
-
-
 def adopt_model_cost_map(new_model_cost_map: dict) -> int:  # mutable-ok: main's signature, the dict goes live
-    """Makes ``new_model_cost_map`` the live ``litellm.model_cost`` as it is, then writes the router rows and every
-    kept registration onto it. Main's helper, kept for its callers. Reloads install documents through
-    ``install_model_cost_map``."""
+    """Makes ``new_model_cost_map`` the live ``litellm.model_cost``, then writes the router rows and every kept
+    ``register_model`` call onto it, in that order as on main. Registrations come after publishing because where each
+    one lands is a lookup in the published table."""
     import litellm
     from litellm import utils
 
@@ -322,17 +298,9 @@ def adopt_model_cost_map(new_model_cost_map: dict) -> int:  # mutable-ok: main's
     return len(new_model_cost_map)
 
 
-def _finalize_model_cost_map(  # pyright: ignore[reportUnusedFunction]  # main's private name, downstream code calls it
-    model_cost: dict,  # mutable-ok: main's signature, pops the rules block
-) -> dict:
-    """Main's private finalizer, kept for its callers: installs ``model_cost`` as the loaded document and returns the
-    rows ``litellm.model_cost`` serves for it, aliases expanded and the ``fallback_generalizations`` block applied."""
-    match model_cost_inputs.install(json.dumps(model_cost).encode()):
-        case NativeRejected(reason=reason):
-            raise ValueError(reason)
-        case installed:
-            model_cost.pop("fallback_generalizations", None)
-            return _loaded(installed)
+def _install(installed: NativeInstalled) -> int:
+    adopt_model_cost_map(_rows_with_rules_set(installed))
+    return installed.model_count
 
 
 def install_model_cost_map(body: bytes, etag: str | None = None) -> ModelCostMapReloadResult:
@@ -343,7 +311,7 @@ def install_model_cost_map(body: bytes, etag: str | None = None) -> ModelCostMap
     return ModelCostMapReloaded(model_count=_install(installed))
 
 
-def _mark_loaded(
+def _mark_rows_with_rules_set(
     source: Literal["local", "remote"],
     url: str | None,
     is_env_forced: bool,
@@ -395,7 +363,7 @@ async def refetch_model_cost_map(
     _warn_ignored_fetch_hooks(sleep, rng, client)
 
     if _uses_bundled_map_only():
-        _mark_loaded("local", None, True, None, datetime.now(timezone.utc))
+        _mark_rows_with_rules_set("local", None, True, None, datetime.now(timezone.utc))
         return ModelCostMapReloaded(model_count=_install(model_cost_inputs.install_bundled()))
 
     fetched: Final = await cost_map_source(url, http_settings()).fetch(fetch_policy(timeout, max_attempts))
@@ -410,7 +378,7 @@ async def refetch_model_cost_map(
             "LiteLLM: model cost map reload failed: %s. Keeping the currently loaded map.", installed.reason
         )
         return ModelCostMapReloadUnavailable(reason=_rejected_reason(installed, url))
-    _mark_loaded("remote", url, False, None, datetime.now(timezone.utc))
+    _mark_rows_with_rules_set("remote", url, False, None, datetime.now(timezone.utc))
     return ModelCostMapReloaded(model_count=_install(installed))
 
 
@@ -431,7 +399,7 @@ def _retry_remote_fetch_in_background(
         if isinstance(installed, NativeRejected):
             _warn_rejected(installed, url)
             return
-        _mark_loaded("remote", url, False, None, datetime.now(timezone.utc))
+        _mark_rows_with_rules_set("remote", url, False, None, datetime.now(timezone.utc))
         _install(installed)
     except Exception as e:  # noqa: BLE001  # a failed background retry must not kill the task; the backup stays
         verbose_logger.warning("LiteLLM: Background model cost map retry failed: %s", e)
@@ -461,8 +429,8 @@ def get_model_cost_map(
     _warn_ignored_fetch_hooks(sleep, rng, client)
     started: Final = datetime.now(timezone.utc)
     if _uses_bundled_map_only() or _is_cli_process():
-        _mark_loaded("local", None, True, None, started)
-        return _loaded(model_cost_inputs.install_bundled())
+        _mark_rows_with_rules_set("local", None, True, None, started)
+        return _rows_with_rules_set(model_cost_inputs.install_bundled())
 
     fetched: Final = cost_map_source(url, None).fetch_blocking(fetch_policy(timeout, 1))
     if isinstance(fetched, NativeFetchFailed):
@@ -478,8 +446,8 @@ def get_model_cost_map(
             url,
             fetched.reason,
         )
-        _mark_loaded("local", url, False, f"Remote fetch failed: {fetched.reason}", started)
-        return _loaded(model_cost_inputs.install_bundled())
+        _mark_rows_with_rules_set("local", url, False, f"Remote fetch failed: {fetched.reason}", started)
+        return _rows_with_rules_set(model_cost_inputs.install_bundled())
 
     installed: Final = model_cost_inputs.install(fetched.body, fetched.etag)
     if isinstance(installed, NativeRejected):
@@ -489,11 +457,11 @@ def get_model_cost_map(
             if installed.integrity
             else f"Remote fetch failed: {_rejected_reason(installed, url)}"
         )
-        _mark_loaded("local", url, False, fallback_reason, started)
-        return _loaded(model_cost_inputs.install_bundled())
+        _mark_rows_with_rules_set("local", url, False, fallback_reason, started)
+        return _rows_with_rules_set(model_cost_inputs.install_bundled())
 
-    _mark_loaded("remote", url, False, None, started)
-    return _loaded(installed)
+    _mark_rows_with_rules_set("remote", url, False, None, started)
+    return _rows_with_rules_set(installed)
 
 
 def fetch_registration_document(url: str) -> dict[str, dict[str, object]] | None:
@@ -508,3 +476,28 @@ def fetch_registration_document(url: str) -> dict[str, dict[str, object]] | None
         verbose_logger.warning("LiteLLM: register_model got an invalid cost map from %s: %s", url, e)
         return None
     return {key: entry for key, entry in document.items() if key != "fallback_generalizations"}
+
+
+def _finalize_model_cost_map(  # pyright: ignore[reportUnusedFunction]  # main's private name, downstream code calls it
+    model_cost: dict,  # mutable-ok: main's signature, pops the rules block
+) -> dict:
+    """Main's private finalizer, kept for its callers: installs ``model_cost`` as the loaded document and returns the
+    rows ``litellm.model_cost`` serves for it, aliases expanded and the ``fallback_generalizations`` block applied."""
+    match model_cost_inputs.install(json.dumps(model_cost).encode()):
+        case NativeRejected(reason=reason):
+            raise ValueError(reason)
+        case installed:
+            model_cost.pop("fallback_generalizations", None)
+            return _rows_with_rules_set(installed)
+
+
+_RESERVED_TOP_LEVEL_KEYS: Final = frozenset({"sample_spec", "fallback_generalizations"})
+
+
+def _count_model_entries(model_cost: Mapping[str, object]) -> int:
+    return sum(1 for key in model_cost if key not in _RESERVED_TOP_LEVEL_KEYS)
+
+
+@lru_cache(maxsize=1)
+def _bundled_model_count() -> int:
+    return _count_model_entries(GetModelCostMap.load_local_model_cost_map())

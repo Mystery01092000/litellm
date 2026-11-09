@@ -123,7 +123,8 @@ from litellm.rust_bridge.catalog import decision
 from litellm.rust_bridge.configuration import Decision
 from litellm.rust_bridge.host.model_cost import (
     AliasedCostEntry,
-    cached_per_version,
+    Landing,
+    VersionCached,
     changed_in_place,
     model_cost_version,
 )
@@ -4138,36 +4139,29 @@ def _skips_builtin_registration_lookup(key: str, provider: object) -> bool:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _RegistrationBase:
-    key: str
-    entry: Mapping[str, object]
-    matched_builtin: bool
-
-
 def model_cost_registration_row(key: str, provider: object) -> Mapping[str, object]:
     """The row a ``register_model`` write of a ``key`` entry with this ``litellm_provider`` merges onto: the
     ``litellm.model_cost`` row it resolves to (``openai/o3-pro`` lands on ``o3-pro``), else the row it seeds ``key``
     with from the built-in entry it falls back to (an OpenAI fine-tune takes its base model's row)."""
     base: Final = registration_base(key, {"litellm_provider": provider}, custom_llm_provider=None)
-    return _builtin_cost_map().get(base.key) or base.entry
+    return _builtin_cost_map().get(base.key) or base.base
 
 
-def registration_base(key: str, value: Mapping[str, object], custom_llm_provider: str | None) -> _RegistrationBase:
+def registration_base(key: str, value: Mapping[str, object], custom_llm_provider: str | None) -> Landing:
     provider: Final = str(value.get("litellm_provider") or "")
     if _skips_builtin_registration_lookup(key, provider):
-        return _RegistrationBase(key=key, entry=dict(_builtin_cost_map().get(key, {})), matched_builtin=True)
+        return Landing(key=key, base=dict(_builtin_cost_map().get(key, {})), matched_builtin=True)
     builtin_model_info: Final = _get_builtin_model_info_for_registration(
         model=key, custom_llm_provider=custom_llm_provider
     )
     if not isinstance(builtin_model_info, ModelInfoLookupMiss):
-        return _RegistrationBase(
+        return Landing(
             key=builtin_model_info["key"],
-            entry=dict(_without_synthesized_costs(builtin_model_info, key=key, value=value)),
+            base=dict(_without_synthesized_costs(builtin_model_info, key=key, value=value)),
             matched_builtin=True,
         )
     fallback: Final = _fallback_registration(key=key, provider=provider, value=value)
-    return _RegistrationBase(key=key, entry=dict(fallback.entry), matched_builtin=fallback.matched_builtin)
+    return Landing(key=key, base=dict(fallback.entry), matched_builtin=fallback.matched_builtin)
 
 
 def _prices_tokens_without_cache_pricing(value: Mapping[str, object]) -> bool:
@@ -7012,7 +7006,7 @@ def _get_max_position_embeddings(model_name: str) -> int | None:
         return None
 
 
-@cached_per_version(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
+@VersionCached
 def cached_get_model_info_helper(
     model: str,
     custom_llm_provider: str | None,
@@ -7031,7 +7025,7 @@ def cached_get_model_info_helper(
 _cached_get_model_info_helper = cached_get_model_info_helper
 
 
-@cached_per_version(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
+@VersionCached
 def cached_cost_map_key(model: str, custom_llm_provider: str | None) -> str | None:
     try:
         return cached_get_model_info_helper(model=model, custom_llm_provider=custom_llm_provider)["key"]
@@ -7591,7 +7585,7 @@ def _build_model_info(
     return ModelInfo(**_model_info, supported_openai_params=supported_openai_params)
 
 
-@cached_per_version(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
+@VersionCached
 def _cached_get_model_info(
     model: str,
     custom_llm_provider: str | None = None,

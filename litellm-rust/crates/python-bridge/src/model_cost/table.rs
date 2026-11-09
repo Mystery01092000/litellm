@@ -8,14 +8,13 @@ use std::collections::HashMap;
 use indexmap::IndexSet;
 use litellm_host_python::to_py;
 use litellm_model_catalog::wire::Fields;
-use litellm_model_catalog::{CostMap, Written};
+use litellm_model_catalog::{CostMap, FALLBACK_GENERALIZATIONS, Written};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use serde_json::Value;
 
 use super::host::{self, Landing};
 
-const FALLBACK_GENERALIZATIONS: &str = "fallback_generalizations";
 const ALIASES: &str = "aliases";
 
 enum Served<'a> {

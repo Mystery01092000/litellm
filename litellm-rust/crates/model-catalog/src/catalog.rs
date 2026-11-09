@@ -12,7 +12,8 @@ use crate::store::{Rows, Store};
 use crate::wire::{EntryWire, Fields};
 
 const SAMPLE_SPEC: &str = "sample_spec";
-const FALLBACK_GENERALIZATIONS: &str = "fallback_generalizations";
+/// The top-level key of the rules block, which is never a model row
+pub const FALLBACK_GENERALIZATIONS: &str = "fallback_generalizations";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IntegrityLimits {

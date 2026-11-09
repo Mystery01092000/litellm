@@ -5,10 +5,8 @@ use serde_json::Value;
 use sha1::{Digest, Sha1};
 
 use crate::bundled::BUNDLED_REGISTRY;
-use crate::catalog::{Catalog, IntegrityLimits};
+use crate::catalog::{Catalog, FALLBACK_GENERALIZATIONS, IntegrityLimits};
 use crate::error::Error;
-
-const FALLBACK_GENERALIZATIONS: &str = "fallback_generalizations";
 
 /// Which document is installed: the `git_blob_id` of its bytes and the ETag it was served with
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -108,13 +108,8 @@ pub(crate) fn call_config(
             Some(snapshot) => configured(&snapshot)?,
             None => HttpSettingsLayer::default(),
         },
-    ])
-    .without_missing_files(&|path: &Path| path.exists());
-    let resolution = Resolution::from(&settings);
-    for unsupported in unreported(&REPORTED_UNSUPPORTED, resolution.unsupported) {
-        crate::logger::capture(py).scope(|| litellm_tracing::warn!("{unsupported}"));
-    }
-    Ok(resolution.config)
+    ]);
+    Ok(resolved(py, settings))
 }
 
 /// The client config for a value of `litellm.rust_bridge.host.settings.http_settings()` the caller handed in, under
@@ -130,13 +125,18 @@ pub(crate) fn settings_config(
     let settings = HttpSettings::from_layers([
         HttpSettingsLayer::from_environment(&ProcessEnvironment),
         configured,
-    ])
-    .without_missing_files(&|path: &Path| path.exists());
-    let resolution = Resolution::from(&settings);
+    ]);
+    Ok(resolved(py, settings))
+}
+
+/// The client config `settings` resolve to, warning once per process about each setting the client cannot apply
+fn resolved(py: Python<'_>, settings: HttpSettings) -> HttpClientConfig {
+    let resolution =
+        Resolution::from(&settings.without_missing_files(&|path: &Path| path.exists()));
     for unsupported in unreported(&REPORTED_UNSUPPORTED, resolution.unsupported) {
         crate::logger::capture(py).scope(|| litellm_tracing::warn!("{unsupported}"));
     }
-    Ok(resolution.config)
+    resolution.config
 }
 
 pub(crate) fn provider_client(

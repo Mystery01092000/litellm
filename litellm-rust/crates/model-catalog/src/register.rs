@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use indexmap::IndexMap;
 
@@ -59,25 +59,17 @@ impl<V> Registrations<V> {
             .map(|(key, value)| (key.as_str(), value))
     }
 
-    /// The registrations that apply to the row under any of `names`, oldest first, as `_RegistrationsOverCatalog` reads them
-    pub fn over<'a>(&'a self, names: &[&str]) -> Vec<&'a V> {
-        let mut applied: Vec<(usize, &V)> = names
-            .iter()
-            .flat_map(|name| {
-                self.landed_on
-                    .get(*name)
-                    .into_iter()
-                    .flatten()
-                    .map(String::as_str)
-                    .chain(std::iter::once(*name))
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter_map(|key| self.entries.get_full(key))
+    /// The registrations that apply to the row under `key`, oldest first, as `_RegistrationsOverCatalog` reads them:
+    /// `key`'s own and every one that landed on it
+    pub fn over<'a>(&'a self, key: &str) -> Vec<&'a V> {
+        let landed = self.landed_on.get(key).into_iter().flatten();
+        let by_order: BTreeMap<usize, &V> = landed
+            .map(String::as_str)
+            .chain([key])
+            .filter_map(|name| self.entries.get_full(name))
             .map(|(order, _, value)| (order, value))
             .collect();
-        applied.sort_unstable_by_key(|(order, _)| *order);
-        applied.into_iter().map(|(_, value)| value).collect()
+        by_order.into_values().collect()
     }
 
     pub fn map<W>(&self, mut convert: impl FnMut(&V) -> W) -> Registrations<W> {
@@ -95,21 +87,14 @@ impl<V> Registrations<V> {
 /// A host's live table that registrations are written into
 pub trait RegistrationTable {
     type Registration;
-    type Landing;
     type Error;
 
-    /// Where `registration` lands, `None` when this table is no longer the one the host publishes
-    fn resolve(
+    /// Writes `registration` where it lands, `None` when this table is no longer the one the host publishes
+    fn place(
         &mut self,
         key: &str,
         registration: &Self::Registration,
-    ) -> Result<Option<Self::Landing>, Self::Error>;
-
-    fn write(
-        &mut self,
-        landing: Self::Landing,
-        registration: &Self::Registration,
-    ) -> Result<Placed, Self::Error>;
+    ) -> Result<Option<Placed>, Self::Error>;
 }
 
 /// Where a registration was written and whether a built-in row matched it
@@ -138,7 +123,7 @@ impl<R> Pass<'_, R> {
     }
 }
 
-/// Writes `entries` into `table` in order, each resolved after the writes before it, so a lookup sees them
+/// Writes `entries` into `table` in order, each placed after the writes before it, so a lookup sees them
 pub fn write_pass<'a, T: RegistrationTable>(
     table: &mut T,
     entries: &'a [(String, T::Registration)],
@@ -146,10 +131,9 @@ pub fn write_pass<'a, T: RegistrationTable>(
     let mut landed = Vec::with_capacity(entries.len());
     let mut unmatched = Vec::new();
     for (key, registration) in entries {
-        let Some(landing) = table.resolve(key, registration)? else {
+        let Some(written) = table.place(key, registration)? else {
             return Ok(Pass::Swapped { landed });
         };
-        let written = table.write(landing, registration)?;
         if !written.matched_builtin {
             unmatched.push((key.as_str(), registration));
         }
@@ -197,7 +181,7 @@ mod tests {
             landed("o3-pro", "o3-pro"),
         ]);
         registrations.register("openai/o3-pro", 4);
-        assert_eq!(registrations.over(&["o3-pro"]), [&2, &4]);
+        assert_eq!(registrations.over("o3-pro"), [&2, &4]);
     }
 
     /// A table published until `swaps_after` writes, whose rows match a built-in only when the key starts with `b`
@@ -208,52 +192,49 @@ mod tests {
 
     impl RegistrationTable for Table {
         type Registration = i32;
-        type Landing = String;
         type Error = ();
 
-        fn resolve(&mut self, key: &str, _: &i32) -> Result<Option<String>, ()> {
-            Ok((self.writes.len() < self.swaps_after).then(|| key.to_uppercase()))
-        }
-
-        fn write(&mut self, landing: String, registration: &i32) -> Result<Placed, ()> {
-            self.writes.push((landing.clone(), *registration));
-            Ok(Placed {
-                matched_builtin: landing.starts_with('B'),
-                key: landing,
-            })
+        fn place(&mut self, key: &str, registration: &i32) -> Result<Option<Placed>, ()> {
+            if self.writes.len() >= self.swaps_after {
+                return Ok(None);
+            }
+            let written = key.to_uppercase();
+            self.writes.push((written.clone(), *registration));
+            Ok(Some(Placed {
+                matched_builtin: written.starts_with('B'),
+                key: written,
+            }))
         }
     }
 
     #[rstest]
-    fn a_pass_writes_every_entry_in_order_and_reports_the_unmatched() {
+    #[case::published_throughout(
+        usize::MAX,
+        Pass::Finished { landed: vec![landed("a", "A"), landed("b", "B")], unmatched: vec![("a", &1)] },
+        &[("A", 1), ("B", 2)],
+    )]
+    #[case::swapped_after_the_first_write(
+        1,
+        Pass::Swapped { landed: vec![landed("a", "A")] },
+        &[("A", 1)],
+    )]
+    fn a_pass_writes_entries_in_order_until_the_table_is_swapped(
+        #[case] swaps_after: usize,
+        #[case] expected: Pass<'static, i32>,
+        #[case] writes: &[(&str, i32)],
+    ) {
         let entries = [("a".to_owned(), 1), ("b".to_owned(), 2)];
         let mut table = Table {
             writes: Vec::new(),
-            swaps_after: usize::MAX,
+            swaps_after,
         };
+        assert_eq!(write_pass(&mut table, &entries), Ok(expected));
         assert_eq!(
-            write_pass(&mut table, &entries),
-            Ok(Pass::Finished {
-                landed: vec![landed("a", "A"), landed("b", "B")],
-                unmatched: vec![("a", &1)],
-            })
+            table.writes,
+            writes
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), *value))
+                .collect::<Vec<_>>()
         );
-        assert_eq!(table.writes, [("A".to_owned(), 1), ("B".to_owned(), 2)]);
-    }
-
-    #[rstest]
-    fn a_pass_stops_at_the_first_entry_resolved_after_a_swap() {
-        let entries = [("a".to_owned(), 1), ("b".to_owned(), 2)];
-        let mut table = Table {
-            writes: Vec::new(),
-            swaps_after: 1,
-        };
-        assert_eq!(
-            write_pass(&mut table, &entries),
-            Ok(Pass::Swapped {
-                landed: vec![landed("a", "A")],
-            })
-        );
-        assert_eq!(table.writes, [("A".to_owned(), 1)]);
     }
 }

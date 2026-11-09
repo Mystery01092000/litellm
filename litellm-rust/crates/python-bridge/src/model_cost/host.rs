@@ -3,7 +3,7 @@
 
 use pyo3::call::PyCallArgs;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyFrozenSet, PyTuple};
+use pyo3::types::{PyDict, PyTuple};
 
 pub(crate) const MODULE: &str = "litellm.rust_bridge.host.model_cost";
 
@@ -35,7 +35,7 @@ pub(crate) fn entry<'py>(
     call(
         py,
         "entry",
-        (fields, PyTuple::new(py, names)?, PyFrozenSet::empty(py)?),
+        (fields, PyTuple::new(py, names)?),
     )
 }
 
