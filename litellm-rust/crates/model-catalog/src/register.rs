@@ -184,6 +184,17 @@ mod tests {
         assert_eq!(registrations.over("o3-pro"), [&2, &4]);
     }
 
+    #[rstest]
+    fn over_applies_a_keys_own_registration_that_landed_on_another_row() {
+        let mut registrations = Registrations::default();
+        registrations.register("openai/o3-pro", 1);
+        registrations.record(&[landed("openai/o3-pro", "o3-pro")]);
+        assert_eq!(
+            (registrations.over("openai/o3-pro"), registrations.over("o3-pro")),
+            (vec![&1], vec![&1])
+        );
+    }
+
     /// A table published until `swaps_after` writes, whose rows match a built-in only when the key starts with `b`
     struct Table {
         writes: Vec<(String, i32)>,
