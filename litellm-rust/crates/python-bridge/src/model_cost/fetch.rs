@@ -98,7 +98,7 @@ impl NativeFetchPolicy {
     #[new]
     /// Retries wait an exponential backoff with jitter from `min_delay_seconds` up to `max_wait_seconds`, or the
     /// server's `Retry-After` up to that cap
-    #[pyo3(signature = (*, max_attempts, max_wait_seconds, timeout_seconds, min_delay_seconds = 2.0))]
+    #[pyo3(signature = (*, max_attempts, max_wait_seconds, timeout_seconds, min_delay_seconds))]
     fn new(
         max_attempts: u32,
         max_wait_seconds: f64,
@@ -113,11 +113,18 @@ impl NativeFetchPolicy {
                 PyValueError::new_err(format!("{name} must be a non-negative number of seconds"))
             })
         };
+        let min_delay = seconds("min_delay_seconds", min_delay_seconds)?;
+        let max_delay = seconds("max_wait_seconds", max_wait_seconds)?;
+        if min_delay > max_delay {
+            return Err(PyValueError::new_err(
+                "min_delay_seconds must not exceed max_wait_seconds",
+            ));
+        }
         Ok(Self(RetryPolicy {
             max_attempts,
             timeout: seconds("timeout_seconds", timeout_seconds)?,
-            min_delay: seconds("min_delay_seconds", min_delay_seconds)?,
-            max_delay: seconds("max_wait_seconds", max_wait_seconds)?,
+            min_delay,
+            max_delay,
         }))
     }
 }
@@ -187,6 +194,20 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::equal_bounds(2.0, 2.0, true)]
+    #[case::min_below_max(2.0, 30.0, true)]
+    #[case::min_above_max(31.0, 30.0, false)]
+    fn a_policy_accepts_a_min_delay_only_up_to_the_max_wait(
+        #[case] min_delay_seconds: f64,
+        #[case] max_wait_seconds: f64,
+        #[case] accepted: bool,
+    ) {
+        Python::initialize();
+        let policy = NativeFetchPolicy::new(3, max_wait_seconds, 5.0, min_delay_seconds);
+        assert_eq!(policy.is_ok(), accepted);
+    }
 
     #[rstest]
     fn a_blocking_fetch_hands_python_the_document_without_starting_the_shared_runtime() {

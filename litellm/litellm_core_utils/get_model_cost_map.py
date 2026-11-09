@@ -52,11 +52,13 @@ from litellm.rust_bridge.host import model_cost as model_cost_host
 from litellm.rust_bridge.host.model_cost import (
     AliasedCostEntry as AliasedCostEntry,  # noqa: PLC0414  # main exported the row type from here
 )
+from litellm.rust_bridge.host.settings import HttpSettings
 
 _CLI_ENTRYPOINT_NAMES: Final = frozenset({"lite", "litellm-proxy"})
 _CATALOG_ADAPTER: Final = TypeAdapter(dict[str, dict[str, object]])
 MODEL_COST_MAP_FETCH_MAX_ATTEMPTS: Final = 3
 MODEL_COST_MAP_FETCH_MAX_WAIT_SECONDS: Final = 30.0
+MODEL_COST_MAP_FETCH_MIN_DELAY_SECONDS: Final = 2.0
 _litellm_import_complete = threading.Event()
 
 model_cost_inputs: Final = NativeModelCostMap.bundled(
@@ -261,8 +263,9 @@ def get_model_cost_map_loaded_at() -> "datetime | None":
     return _LastLoad.current.loaded_at
 
 
-def cost_map_source(url: str, http_settings: object | None) -> NativeCostMapSource:
-    """``http_settings`` is ``None`` for the environment alone, as main's import-time ``httpx.get`` read it."""
+def cost_map_source(url: str, http_settings: HttpSettings | None) -> NativeCostMapSource:
+    """``http_settings`` is ``None`` where main fetched with bare ``httpx``, which ignored ``litellm.*`` settings. The
+    client still reads every HTTP env var LiteLLM honors, so ``SSL_VERIFY`` and ``LITELLM_USER_AGENT`` apply too."""
     return NativeCostMapSource(url, http_settings=http_settings)
 
 
@@ -271,6 +274,7 @@ def fetch_policy(timeout: float, max_attempts: int) -> NativeFetchPolicy:
         max_attempts=max_attempts,
         max_wait_seconds=MODEL_COST_MAP_FETCH_MAX_WAIT_SECONDS,
         timeout_seconds=timeout,
+        min_delay_seconds=MODEL_COST_MAP_FETCH_MIN_DELAY_SECONDS,
     )
 
 

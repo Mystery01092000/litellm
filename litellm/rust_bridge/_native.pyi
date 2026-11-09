@@ -8,6 +8,7 @@ from typing_extensions import disjoint_base
 
 from litellm.redis.store_settings import RedisBreakerSettings, RedisStoreSettings
 from litellm.rust_bridge.execution import Execution
+from litellm.rust_bridge.host.settings import HttpSettings
 from litellm.rust_bridge.public_call import NativeCall
 
 _T_co = TypeVar("_T_co", covariant=True)
@@ -24,7 +25,7 @@ def native_redis_breaker_states() -> list[str]: ...
 
 @final
 class NativeCostMapSource:
-    def __new__(cls, url: str, *, http_settings: object | None) -> NativeCostMapSource: ...
+    def __new__(cls, url: str, *, http_settings: HttpSettings | None) -> NativeCostMapSource: ...
     def fetch(self, policy: NativeFetchPolicy) -> Future[NativeFetched | NativeFetchFailed]: ...
     def fetch_blocking(
         self, policy: NativeFetchPolicy, resume_from: NativeFetchFailed | None = None
@@ -38,7 +39,7 @@ class NativeFetchPolicy:
         max_attempts: int,
         max_wait_seconds: float,
         timeout_seconds: float,
-        min_delay_seconds: float = 2.0,
+        min_delay_seconds: float,
     ) -> NativeFetchPolicy: ...
 
 @final
