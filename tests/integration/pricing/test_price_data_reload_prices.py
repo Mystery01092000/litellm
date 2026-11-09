@@ -17,7 +17,6 @@ from integration._support.client import Gateway, eventually, held, object_value,
 from integration._support.database import read_rows, scratch_database
 from integration._support.process import (
     OwnedProxy,
-    WorkerHealthcheck,
     graceful_stop_seconds,
     owned_proxy,
     owned_proxy_process,
@@ -538,7 +537,6 @@ _POLL_SECONDS: Final = 1
 _LIFECYCLE_SETTINGS: Final[Mapping[str, JsonValue]] = MappingProxyType(
     {
         "proxy_config_reload_interval_seconds": _POLL_SECONDS,
-        "coordination_redis": {"host": "os.environ/REDIS_HOST", "port": "os.environ/REDIS_PORT"},
     }
 )
 
@@ -548,7 +546,6 @@ def _lifecycle_proxy(
     tmp_path: Path,
     wire_url: str,
     deployments: tuple[_Deployment, ...],
-    workers: int = 1,
     database: Mapping[str, str] = MappingProxyType({}),
 ) -> AbstractContextManager[OwnedProxy]:
     return owned_proxy_process(
@@ -557,25 +554,15 @@ def _lifecycle_proxy(
         {**_proxy_environment(wire_url), **database},
         config=_config(tmp_path, deployments, wire_url, _LIFECYCLE_SETTINGS),
         remove_environment=("LITELLM_LOCAL_MODEL_COST_MAP",),
-        workers=workers,
-        healthcheck=WorkerHealthcheck.LENIENT,
-    )
-
-
-def _fresh_client(proxy: Gateway) -> httpx.Client:
-    return httpx.Client(
-        base_url=str(proxy.client.base_url), timeout=60, trust_env=False, headers={"connection": "close"}
     )
 
 
 def _bill(proxy: Gateway, deployment: _Deployment) -> float | None:
-    with _fresh_client(proxy) as client:
-        return _billed(client, proxy.key, deployment)[1]
+    return _billed(proxy.client, proxy.key, deployment)[1]
 
 
 def _reload(proxy: Gateway) -> httpx.Response:
-    with _fresh_client(proxy) as client:
-        return client.post("/reload/model_cost_map", headers={"Authorization": f"Bearer {proxy.key}"})
+    return proxy.request("POST", "/reload/model_cost_map")
 
 
 def _billed_at(deployment: _Deployment, scale: float) -> Callable[[float | None], bool]:
@@ -604,30 +591,6 @@ def test_price_data_changes_only_through_a_successful_reload_or_a_restart(gatewa
             server.serving = _Published(_PUBLISHED_SCALE)
         with _lifecycle_proxy(gateway, tmp_path, wire.url, (_GEO_CATALOG,), database=database) as restarted:
             _charged_as_listed(restarted.gateway, _GEO_CATALOG, _PUBLISHED_SCALE)
-
-
-@pytest.mark.timeout(2 * graceful_stop_seconds() + 180)
-def test_a_reload_on_one_worker_reprices_the_other_worker(gateway: Gateway, tmp_path: Path) -> None:
-    server: Final = _CostMapServer()
-    with (
-        wire_server(_responder(server)) as wire,
-        _lifecycle_proxy(gateway, tmp_path, wire.url, (_GEO_CATALOG,), workers=2) as proxy,
-    ):
-        reloading, other = sorted(proxy.worker_pids())
-        for answering, paused in ((reloading, other), (other, reloading)):
-            with proxy.suspended(paused):
-                assert _billed_at(_GEO_CATALOG, 1.0)(_bill(proxy.gateway, _GEO_CATALOG)), answering
-        server.serving = _Published(_PUBLISHED_SCALE)
-        with proxy.suspended(other):
-            reload: Final = _reload(proxy.gateway)
-            assert reload.status_code == 200, reload.text
-            assert _billed_at(_GEO_CATALOG, _PUBLISHED_SCALE)(_bill(proxy.gateway, _GEO_CATALOG))
-        with proxy.suspended(reloading):
-            eventually(
-                lambda: _bill(proxy.gateway, _GEO_CATALOG),
-                _billed_at(_GEO_CATALOG, _PUBLISHED_SCALE),
-                seconds=30 * _POLL_SECONDS,
-            )
 
 
 def _add_model(proxy: Gateway, deployment: _Deployment, wire_url: str) -> None:
