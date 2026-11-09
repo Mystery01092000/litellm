@@ -5,16 +5,23 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final
+from typing import Final, TypeAlias
 
 import httpx
 import pytest
-from integration._support.client import Gateway, eventually, object_value, string_value
-from integration._support.database import read_rows
-from integration._support.process import graceful_stop_seconds, owned_proxy
+from integration._support.client import Gateway, eventually, held, object_value, string_value
+from integration._support.database import read_rows, scratch_database
+from integration._support.process import (
+    OwnedProxy,
+    WorkerHealthcheck,
+    graceful_stop_seconds,
+    owned_proxy,
+    owned_proxy_process,
+)
 from integration._support.wire import Reply, Request, wire_server
 from pydantic import JsonValue
 
@@ -82,6 +89,24 @@ _CATALOG: Final[Mapping[str, Mapping[str, JsonValue]]] = MappingProxyType(
         },
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _Published:
+    scale: float
+
+
+@dataclass(frozen=True, slots=True)
+class _Failing:
+    status: int
+
+
+_Served: TypeAlias = _Published | _Failing
+
+
+class _CostMapServer:
+    def __init__(self, serving: _Served = _Published(1.0)) -> None:
+        self.serving: _Served = serving
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,8 +214,13 @@ def _connection(model: str, wire_url: str) -> dict[str, JsonValue]:
     return {"api_base": f"{wire_url}/v1", "api_key": "synthetic-openai-key"}
 
 
-def _config(directory: Path, deployments: tuple[_Deployment, ...], wire_url: str) -> Path:
-    config: Final = directory / "price_data_reload_config.yaml"
+def _config(
+    directory: Path,
+    deployments: tuple[_Deployment, ...],
+    wire_url: str,
+    general: Mapping[str, JsonValue] = MappingProxyType({}),
+) -> Path:
+    config: Final = directory / f"price_data_reload_config_{uuid.uuid4().hex}.yaml"
     config.write_text(
         json.dumps(
             {
@@ -208,6 +238,7 @@ def _config(directory: Path, deployments: tuple[_Deployment, ...], wire_url: str
                 "general_settings": {
                     "master_key": "os.environ/LITELLM_MASTER_KEY",
                     "database_url": "os.environ/DATABASE_URL",
+                    **general,
                 },
                 "router_settings": {"disable_cooldowns": True},
             }
@@ -276,10 +307,18 @@ def _reply(request: Request) -> Reply:
     )
 
 
-def _responder(published: threading.Event) -> Callable[[Request], Reply]:
+def _cost_map_reply(served: _Served) -> Reply:
+    match served:
+        case _Published(scale=scale):
+            return Reply(body=json.dumps(_catalog(scale)).encode())
+        case _Failing(status=status):
+            return Reply(status=status, body=b"{}")
+
+
+def _responder(server: _CostMapServer) -> Callable[[Request], Reply]:
     def respond(request: Request) -> Reply:
         if request.target == "/model_prices.json":
-            return Reply(body=json.dumps(_catalog(_PUBLISHED_SCALE if published.is_set() else 1.0)).encode())
+            return _cost_map_reply(server.serving)
         if request.method == "GET":
             return Reply(body=json.dumps({"object": "list", "data": []}).encode())
         return _reply(request)
@@ -340,9 +379,9 @@ def _proxy_environment(wire_url: str) -> dict[str, str]:
 
 
 def _assert_priced_across_a_reload(gateway: Gateway, tmp_path: Path, deployments: tuple[_Deployment, ...]) -> None:
-    published: Final = threading.Event()
+    server: Final = _CostMapServer()
     with (
-        wire_server(_responder(published)) as wire,
+        wire_server(_responder(server)) as wire,
         owned_proxy(
             gateway,
             tmp_path,
@@ -352,7 +391,7 @@ def _assert_priced_across_a_reload(gateway: Gateway, tmp_path: Path, deployments
         ) as proxy,
     ):
         before: Final = tuple(_charged_as_listed(proxy, deployment, 1.0) for deployment in deployments)
-        published.set()
+        server.serving = _Published(_PUBLISHED_SCALE)
         reload: Final = proxy.request("POST", "/reload/model_cost_map")
         assert reload.status_code == 200, reload.text
         after: Final = tuple(_charged_as_listed(proxy, deployment, _PUBLISHED_SCALE) for deployment in deployments)
@@ -467,7 +506,7 @@ def test_price_data_reloads_under_custom_priced_traffic_keep_every_deployment_pr
     geo: Final = _Deployment("geo-unpriced", f"bedrock/{_GEO}", {}, _Usage(1000, 0, 500), _catalog_rates(_GEO))
     finished: Final = threading.Event()
     with (
-        wire_server(_responder(threading.Event())) as wire,
+        wire_server(_responder(_CostMapServer())) as wire,
         owned_proxy(
             gateway,
             tmp_path,
@@ -491,4 +530,154 @@ def test_price_data_reloads_under_custom_priced_traffic_keep_every_deployment_pr
         assert tuple(charged for charged, _ in charges) == pytest.approx(tuple(expected for _, expected in charges))
         settled: Final = tuple(_charged_as_listed(proxy, deployment, 1.0) for deployment in (geo, *storm))
         for charge in settled:
+            assert _spend(charge.request_id) == pytest.approx(charge.expected, rel=1e-6)
+
+
+_GEO_CATALOG: Final = _Deployment("geo-unpriced", f"bedrock/{_GEO}", {}, _Usage(1000, 0, 500), _catalog_rates(_GEO))
+_POLL_SECONDS: Final = 1
+_LIFECYCLE_SETTINGS: Final[Mapping[str, JsonValue]] = MappingProxyType(
+    {
+        "proxy_config_reload_interval_seconds": _POLL_SECONDS,
+        "coordination_redis": {"host": "os.environ/REDIS_HOST", "port": "os.environ/REDIS_PORT"},
+    }
+)
+
+
+def _lifecycle_proxy(
+    gateway: Gateway,
+    tmp_path: Path,
+    wire_url: str,
+    deployments: tuple[_Deployment, ...],
+    workers: int = 1,
+    database: Mapping[str, str] = MappingProxyType({}),
+) -> AbstractContextManager[OwnedProxy]:
+    return owned_proxy_process(
+        gateway,
+        tmp_path,
+        {**_proxy_environment(wire_url), **database},
+        config=_config(tmp_path, deployments, wire_url, _LIFECYCLE_SETTINGS),
+        remove_environment=("LITELLM_LOCAL_MODEL_COST_MAP",),
+        workers=workers,
+        healthcheck=WorkerHealthcheck.LENIENT,
+    )
+
+
+def _fresh_client(proxy: Gateway) -> httpx.Client:
+    return httpx.Client(
+        base_url=str(proxy.client.base_url), timeout=60, trust_env=False, headers={"connection": "close"}
+    )
+
+
+def _bill(proxy: Gateway, deployment: _Deployment) -> float | None:
+    with _fresh_client(proxy) as client:
+        return _billed(client, proxy.key, deployment)[1]
+
+
+def _reload(proxy: Gateway) -> httpx.Response:
+    with _fresh_client(proxy) as client:
+        return client.post("/reload/model_cost_map", headers={"Authorization": f"Bearer {proxy.key}"})
+
+
+def _billed_at(deployment: _Deployment, scale: float) -> Callable[[float | None], bool]:
+    expected: Final = _expected_cost(deployment.rates(scale), deployment.usage)
+    return lambda charged: charged == pytest.approx(expected, rel=1e-6)
+
+
+@pytest.mark.timeout(4 * graceful_stop_seconds() + 180)
+def test_price_data_changes_only_through_a_successful_reload_or_a_restart(gateway: Gateway, tmp_path: Path) -> None:
+    server: Final = _CostMapServer()
+    with wire_server(_responder(server)) as wire, scratch_database("reload_lifecycle") as database_url:
+        database: Final = {"DATABASE_URL": database_url}
+        with _lifecycle_proxy(gateway, tmp_path, wire.url, (_GEO_CATALOG,), database=database) as first:
+            _charged_as_listed(first.gateway, _GEO_CATALOG, 1.0)
+            server.serving = _Published(_PUBLISHED_SCALE)
+            held(
+                lambda: _bill(first.gateway, _GEO_CATALOG),
+                _billed_at(_GEO_CATALOG, 1.0),
+                holding=3 * _POLL_SECONDS,
+            )
+            for status in (404, 503):
+                server.serving = _Failing(status)
+                reload: Final = _reload(first.gateway)
+                assert reload.status_code == 502, (status, reload.text)
+                _charged_as_listed(first.gateway, _GEO_CATALOG, 1.0)
+            server.serving = _Published(_PUBLISHED_SCALE)
+        with _lifecycle_proxy(gateway, tmp_path, wire.url, (_GEO_CATALOG,), database=database) as restarted:
+            _charged_as_listed(restarted.gateway, _GEO_CATALOG, _PUBLISHED_SCALE)
+
+
+@pytest.mark.timeout(2 * graceful_stop_seconds() + 180)
+def test_a_reload_on_one_worker_reprices_the_other_worker(gateway: Gateway, tmp_path: Path) -> None:
+    server: Final = _CostMapServer()
+    with (
+        wire_server(_responder(server)) as wire,
+        _lifecycle_proxy(gateway, tmp_path, wire.url, (_GEO_CATALOG,), workers=2) as proxy,
+    ):
+        reloading, other = sorted(proxy.worker_pids())
+        for answering, paused in ((reloading, other), (other, reloading)):
+            with proxy.suspended(paused):
+                assert _billed_at(_GEO_CATALOG, 1.0)(_bill(proxy.gateway, _GEO_CATALOG)), answering
+        server.serving = _Published(_PUBLISHED_SCALE)
+        with proxy.suspended(other):
+            reload: Final = _reload(proxy.gateway)
+            assert reload.status_code == 200, reload.text
+            assert _billed_at(_GEO_CATALOG, _PUBLISHED_SCALE)(_bill(proxy.gateway, _GEO_CATALOG))
+        with proxy.suspended(reloading):
+            eventually(
+                lambda: _bill(proxy.gateway, _GEO_CATALOG),
+                _billed_at(_GEO_CATALOG, _PUBLISHED_SCALE),
+                seconds=30 * _POLL_SECONDS,
+            )
+
+
+def _add_model(proxy: Gateway, deployment: _Deployment, wire_url: str) -> None:
+    created: Final = proxy.post(
+        "/model/new",
+        {
+            "model_name": deployment.name,
+            "litellm_params": {
+                "model": deployment.model,
+                **_connection(deployment.model, wire_url),
+                **deployment.prices,
+            },
+            "model_info": {},
+        },
+    )
+    assert object_value(created["model_info"])["id"], created
+
+
+def _custom_with_catalog_cache(model: str) -> Callable[[float], _Rates]:
+    return lambda scale: _Rates(
+        input=_CUSTOM["input_cost_per_token"],
+        output=_CUSTOM["output_cost_per_token"],
+        cache_read=_rate(model, "cache_read_input_token_cost", scale),
+    )
+
+
+@pytest.mark.timeout(2 * graceful_stop_seconds() + 180)
+def test_a_model_added_through_the_api_keeps_its_prices_and_inherits_the_reloaded_ones(
+    gateway: Gateway, tmp_path: Path
+) -> None:
+    added: Final = _Deployment(
+        "added-finetune-custom",
+        f"openai/{_FINETUNE}",
+        _CUSTOM,
+        _Usage(2000, 1000, 1000),
+        _custom_with_catalog_cache(_FINETUNE),
+    )
+    server: Final = _CostMapServer()
+    with (
+        wire_server(_responder(server)) as wire,
+        _lifecycle_proxy(gateway, tmp_path, wire.url, (_GEO_CATALOG,)) as owned,
+    ):
+        proxy: Final = owned.gateway
+        _add_model(proxy, added, wire.url)
+        before: Final = tuple(_charged_as_listed(proxy, deployment, 1.0) for deployment in (_GEO_CATALOG, added))
+        server.serving = _Published(_PUBLISHED_SCALE)
+        reload: Final = _reload(proxy)
+        assert reload.status_code == 200, reload.text
+        after: Final = tuple(
+            _charged_as_listed(proxy, deployment, _PUBLISHED_SCALE) for deployment in (_GEO_CATALOG, added)
+        )
+        for charge in (*before, *after):
             assert _spend(charge.request_id) == pytest.approx(charge.expected, rel=1e-6)
