@@ -1,5 +1,5 @@
 use litellm_model_catalog::{
-    BUNDLED_REGISTRY, CostMap, ErrorKind, IntegrityLimits, Provenance, Refused, git_blob_id,
+    BUNDLED_REGISTRY, CostMap, ErrorKind, IntegrityLimits, Provenance, git_blob_id,
 };
 use rstest::rstest;
 use serde_json::json;
@@ -19,12 +19,8 @@ fn a_refused_document_says_whether_it_failed_the_integrity_limits(
     #[case] integrity: bool,
     #[case] kind: ErrorKind,
 ) {
-    let error = match CostMap::read(body, None, limits).unwrap_err() {
-        Refused::Integrity(error) if integrity => error,
-        Refused::Unreadable(error) if !integrity => error,
-        refused => panic!("{refused:?}"),
-    };
-    assert_eq!(error.kind(), kind);
+    let error = CostMap::read(body, None, limits).unwrap_err();
+    assert_eq!((error.is_integrity(), error.kind()), (integrity, kind));
 }
 
 #[rstest]

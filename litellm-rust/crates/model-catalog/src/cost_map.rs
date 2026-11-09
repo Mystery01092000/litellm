@@ -6,7 +6,7 @@ use sha1::{Digest, Sha1};
 
 use crate::bundled::BUNDLED_REGISTRY;
 use crate::catalog::{Catalog, IntegrityLimits};
-use crate::error::{Error, ErrorKind};
+use crate::error::Error;
 
 const FALLBACK_GENERALIZATIONS: &str = "fallback_generalizations";
 
@@ -30,17 +30,6 @@ struct Base {
     catalog: Catalog,
     /// Each owner's names, the owner first, for owners with at least one alias
     groups: IndexMap<String, Vec<String>>,
-}
-
-/// Why a fetched document was not installed
-#[derive(Debug, thiserror::Error)]
-pub enum Refused {
-    /// It is not a cost map document
-    #[error(transparent)]
-    Unreadable(Error),
-    /// It parsed but has fewer models than the integrity limits allow
-    #[error(transparent)]
-    Integrity(Error),
 }
 
 impl Base {
@@ -78,20 +67,12 @@ impl CostMap {
 
     /// Reads a fetched document. One that does not parse, or that has fewer models than `limits` allow against the
     /// bundled one, is refused. Every alias problem it has is logged
-    pub fn read(
-        body: &[u8],
-        etag: Option<String>,
-        limits: IntegrityLimits,
-    ) -> Result<Self, Refused> {
-        let loaded = Catalog::parse(body).map_err(|error| match error.kind() {
-            ErrorKind::Empty => Refused::Integrity(error),
-            _ => Refused::Unreadable(error),
-        })?;
+    pub fn read(body: &[u8], etag: Option<String>, limits: IntegrityLimits) -> Result<Self, Error> {
+        let loaded = Catalog::parse(body)?;
         loaded
             .value
-            .check_size(BUNDLED.base.catalog.model_count(), limits)
-            .map_err(Refused::Integrity)?;
-        for problem in loaded.errors.iter().filter(|error| concerns_aliases(error)) {
+            .check_size(BUNDLED.base.catalog.model_count(), limits)?;
+        for problem in loaded.errors.iter().filter(|error| error.is_alias()) {
             litellm_tracing::warn!(
                 "LiteLLM: model cost map alias problem: {}",
                 litellm_error::Report::new(problem)
@@ -142,20 +123,11 @@ impl CostMap {
     }
 }
 
-fn concerns_aliases(error: &Error) -> bool {
-    matches!(
-        error.kind(),
-        ErrorKind::AliasShadowsModel
-            | ErrorKind::AliasTaken
-            | ErrorKind::AliasTargetMissing
-            | ErrorKind::AliasRowField
-    ) || matches!(error.field().as_deref(), Some("aliases" | "alias_of"))
-}
-
 /// `git hash-object` of the bytes, which main reports as `source_revision`
 pub fn git_blob_id(body: &[u8]) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(format!("blob {}\0", body.len()).as_bytes());
-    hasher.update(body);
-    format!("{:x}", hasher.finalize())
+    let digest = Sha1::new()
+        .chain_update(format!("blob {}\0", body.len()))
+        .chain_update(body)
+        .finalize();
+    format!("{digest:x}")
 }
