@@ -2928,6 +2928,13 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
             "every replica. On by default; set to tune the window, pin a job, or turn it off."
         ),
     )
+    performance_alerts_enabled: bool = Field(
+        False,
+        description=(
+            "Detect daily changes in recorded Usage for gateway, models, teams, users and keys. "
+            "Off by default. Uses spend, request volume, mean full-response duration and failure rate."
+        ),
+    )
     spend_capture_rate_check: SpendCaptureRateCheckSettings | None = Field(
         None,
         description=(

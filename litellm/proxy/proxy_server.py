@@ -11877,6 +11877,22 @@ class ProxyStartupEvent:
             read_general_settings=_current_general_settings,
         )
 
+        from litellm.proxy.spend_tracking.performance_alerts import run_performance_alerts
+
+        async def _scheduled_performance_alerts() -> None:
+            if _current_general_settings().get("performance_alerts_enabled") is True:
+                await run_performance_alerts(prisma_client)
+
+        scheduler.add_job(  # pyright: ignore[reportUnknownMemberType]  # APScheduler does not provide typed job methods
+            _scheduled_performance_alerts,
+            "interval",
+            minutes=5,
+            id="performance_alerts",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
         ### PTU DAILY ROLLUP ###
         from litellm.proxy.spend_tracking.ptu_feature_flag import (
             is_ptu_cost_attribution_enabled,

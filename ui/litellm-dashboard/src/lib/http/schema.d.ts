@@ -31398,6 +31398,12 @@ export interface components {
              */
             password_policy_require_uppercase?: boolean | null;
             /**
+             * Performance Alerts Enabled
+             * @description Detect daily changes in recorded Usage for gateway, models, teams, users and keys. Off by default. Uses spend, request volume, mean full-response duration and failure rate.
+             * @default false
+             */
+            performance_alerts_enabled: boolean;
+            /**
              * Plugins
              * @description external services registered as embeddable UI plugins
              */

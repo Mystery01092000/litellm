@@ -892,6 +892,7 @@ model LiteLLM_DailyUserSpend {
 
   @@unique([user_id, date, api_key, model, custom_llm_provider, mcp_namespaced_tool_name, endpoint])
   @@index([date])
+  @@index([date, id])
   @@index([user_id, date])
   @@index([api_key])
   @@index([model])
@@ -1074,6 +1075,7 @@ model LiteLLM_DailyTeamSpend {
 
   @@unique([team_id, date, api_key, model, custom_llm_provider, mcp_namespaced_tool_name, endpoint])
   @@index([date])
+  @@index([date, id])
   @@index([team_id, date])
   @@index([api_key])
   @@index([model])
@@ -2184,4 +2186,15 @@ model LiteLLM_Alert {
   updated_by    String?  @client.VarChar(1024)
 
   @@index([status, id])
+}
+
+model LiteLLM_PerformanceAlertWork {
+  day           DateTime @client.Date
+  resource_hash String   @client.VarChar(64)
+  priority      Float
+  data          Json
+  evaluated     Boolean  @default(false)
+
+  @@id([day, resource_hash])
+  @@index([day, evaluated, priority(sort: Desc), resource_hash])
 }
