@@ -1,32 +1,23 @@
 use std::borrow::Cow;
-use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use backon::Retryable;
 use litellm_error::Report;
 use litellm_http::Client;
-use litellm_s3::ProvideCredentials;
 use url::Url;
 
 use crate::attempt::{self, Cause, Fetched, Rejected};
 use crate::{RetryPolicy, Source};
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct Target {
-    pub url: String,
-    pub aws_region: String,
-    pub aws_endpoint_url: Option<String>,
-}
-
-impl fmt::Debug for Target {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Target")
-            .field("url", &redacted(&self.url))
-            .field("aws_region", &self.aws_region)
-            .field("aws_endpoint_url", &self.aws_endpoint_url)
-            .finish()
-    }
+/// How an `s3://` fetch reaches S3
+#[derive(Clone, Debug)]
+pub enum S3Access {
+    /// What an AWS SDK finds in the environment and shared config files, loaded on each `s3://` attempt, with
+    /// `region` winning over the region it finds
+    Environment { region: Option<String> },
+    /// A config the caller built with its region, endpoint and credentials
+    Config(Box<litellm_s3::sdk::Config>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,14 +37,14 @@ pub enum Start {
 
 pub async fn fetch(
     client: &Client,
-    credentials: &(impl ProvideCredentials + Clone + 'static),
-    target: &Target,
+    s3: &S3Access,
+    url: &str,
     policy: RetryPolicy,
     start: Start,
 ) -> Result<Fetched, Failed> {
-    let url = redacted(&target.url);
+    let shown = redacted(url);
     let source =
-        Source::parse(&target.url).map_err(|error| Failed::of(&url, &Rejected::fatal(error), 1))?;
+        Source::parse(url).map_err(|error| Failed::of(&shown, &Rejected::fatal(error), 1))?;
     let mut backoff = policy.backoff();
     let made = AtomicU32::new(0);
     if let Start::After(failed) = start {
@@ -68,9 +59,7 @@ pub async fn fetch(
         async {
             match &source {
                 Source::Http(http) => attempt::http(client, http.clone(), policy.timeout).await,
-                Source::S3(object) => {
-                    attempt::s3(client, credentials, target, object, policy.timeout).await
-                }
+                Source::S3(object) => attempt::s3(client, s3, object, policy.timeout).await,
             }
         }
     };
@@ -84,12 +73,12 @@ pub async fn fetch(
                 "LiteLLM: model cost map fetch attempt {}/{} failed ({}); retrying in {:.1}s",
                 made.load(Ordering::Relaxed),
                 policy.max_attempts,
-                reason(&url, &rejected.cause),
+                reason(&shown, &rejected.cause),
                 wait.as_secs_f64(),
             );
         })
         .await
-        .map_err(|rejected| Failed::of(&url, &rejected, made.load(Ordering::Relaxed)))
+        .map_err(|rejected| Failed::of(&shown, &rejected, made.load(Ordering::Relaxed)))
 }
 
 impl Failed {

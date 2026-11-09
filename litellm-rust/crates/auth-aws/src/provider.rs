@@ -10,29 +10,11 @@ type Environment = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 #[derive(Clone)]
 pub struct AwsCredentialsProvider {
     auth: AwsAuthService,
-    source: Source,
-}
-
-#[derive(Clone)]
-enum Source {
-    DefaultChain {
-        region: String,
-    },
-    Configured {
-        config: Box<AwsAuthConfig>,
-        environment: Environment,
-    },
+    config: Box<AwsAuthConfig>,
+    environment: Environment,
 }
 
 impl AwsCredentialsProvider {
-    /// What botocore's default chain finds in `region`, without LiteLLM's Bedrock settings
-    pub fn default_chain(auth: AwsAuthService, region: String) -> Self {
-        Self {
-            auth,
-            source: Source::DefaultChain { region },
-        }
-    }
-
     /// Explicit keys in `config` as given, otherwise LiteLLM's `AWS_*` settings read through `environment`
     pub fn configured(
         auth: AwsAuthService,
@@ -41,36 +23,31 @@ impl AwsCredentialsProvider {
     ) -> Self {
         Self {
             auth,
-            source: Source::Configured {
-                config: Box::new(config),
-                environment: Arc::new(environment),
-            },
+            config: Box::new(config),
+            environment: Arc::new(environment),
         }
     }
 
     async fn credentials(&self) -> Result<Credentials, crate::Error> {
-        match &self.source {
-            Source::DefaultChain { region } => self.auth.default_chain_credentials(region).await,
-            Source::Configured {
-                config,
-                environment,
-            } => match (&config.access_key_id, &config.secret_access_key) {
-                (Some(access_key_id), Some(secret_access_key)) => Ok(Credentials::new(
-                    access_key_id.expose(),
-                    secret_access_key.expose(),
-                    config
-                        .session_token
-                        .as_ref()
-                        .map(|token| token.expose().to_owned()),
-                    None,
-                    "litellm-configured",
-                )),
-                _ => {
-                    self.auth
-                        .resolve_credentials(AwsAuthConfig::clone(config), environment.as_ref())
-                        .await
-                }
-            },
+        match (&self.config.access_key_id, &self.config.secret_access_key) {
+            (Some(access_key_id), Some(secret_access_key)) => Ok(Credentials::new(
+                access_key_id.expose(),
+                secret_access_key.expose(),
+                self.config
+                    .session_token
+                    .as_ref()
+                    .map(|token| token.expose().to_owned()),
+                None,
+                "litellm-configured",
+            )),
+            _ => {
+                self.auth
+                    .resolve_credentials(
+                        AwsAuthConfig::clone(&self.config),
+                        self.environment.as_ref(),
+                    )
+                    .await
+            }
         }
     }
 }

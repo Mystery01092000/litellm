@@ -3,14 +3,13 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use litellm_http::Client;
-use litellm_s3::ProvideCredentials;
 use litellm_s3::S3Uri;
 use litellm_s3::sdk::config::retry::RetryConfig;
 use litellm_s3::sdk::config::timeout::TimeoutConfig;
 use reqwest::header::{ETAG, HeaderMap, RETRY_AFTER};
 use url::Url;
 
-use crate::{Error, RETRYABLE_STATUSES, Target};
+use crate::{Error, RETRYABLE_STATUSES, S3Access};
 
 pub(crate) const MAX_BODY_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -43,7 +42,7 @@ impl Rejected {
     }
 }
 
-/// Any status below 400 is the document, redirects included, since the caller's client does not follow them
+/// Any status below 400 is the document
 pub(crate) async fn http(
     client: &Client,
     url: Url,
@@ -91,25 +90,24 @@ pub(crate) async fn http(
 /// S3 failures are final: the SDK already classifies its own errors and a missing or denied object stays so
 pub(crate) async fn s3(
     client: &Client,
-    credentials: &(impl ProvideCredentials + Clone + 'static),
-    target: &Target,
+    s3: &S3Access,
     object: &S3Uri,
     timeout: Duration,
 ) -> Result<Fetched, Rejected> {
-    let config = litellm_s3::config(
-        target.aws_region.clone(),
-        target.aws_endpoint_url.as_deref(),
-        client.clone(),
-        credentials.clone(),
-    )
-    .retry_config(RetryConfig::disabled())
-    .timeout_config(
-        TimeoutConfig::builder()
-            .operation_attempt_timeout(timeout)
-            .build(),
-    )
-    .build();
     let fetched = async {
+        let config = match s3 {
+            S3Access::Environment { region } => {
+                litellm_s3::environment_config(client.clone(), region.clone()).await
+            }
+            S3Access::Config(config) => config.to_builder(),
+        }
+        .retry_config(RetryConfig::disabled())
+        .timeout_config(
+            TimeoutConfig::builder()
+                .operation_attempt_timeout(timeout)
+                .build(),
+        )
+        .build();
         let output = litellm_s3::sdk::Client::from_conf(config)
             .get_object()
             .bucket(&object.bucket)

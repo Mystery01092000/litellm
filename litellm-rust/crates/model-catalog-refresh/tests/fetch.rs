@@ -7,7 +7,7 @@ use aws_credential_types::Credentials;
 use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::{ProvideCredentials, future};
 use litellm_http::Client;
-use litellm_model_catalog_refresh::{Failed, Fetched, RetryPolicy, Start, Target, fetch};
+use litellm_model_catalog_refresh::{Failed, Fetched, RetryPolicy, S3Access, Start, fetch};
 use rstest::rstest;
 
 const POLICY: RetryPolicy = RetryPolicy {
@@ -99,14 +99,6 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-fn target(url: &str) -> Target {
-    Target {
-        url: url.to_owned(),
-        aws_region: "us-west-2".into(),
-        aws_endpoint_url: None,
-    }
-}
-
 #[derive(Clone, Debug)]
 struct NoCredentials;
 
@@ -129,8 +121,15 @@ fn keys() -> Credentials {
     )
 }
 
-async fn fetched(target: &Target, policy: RetryPolicy, start: Start) -> Result<Fetched, Failed> {
-    fetch(&Client::for_test(), &NoCredentials, target, policy, start).await
+async fn fetched(url: &str, policy: RetryPolicy, start: Start) -> Result<Fetched, Failed> {
+    fetch(
+        &Client::for_test(),
+        &S3Access::Environment { region: None },
+        url,
+        policy,
+        start,
+    )
+    .await
 }
 
 #[rstest]
@@ -153,7 +152,7 @@ async fn a_200_returns_the_body_and_its_etags(
 ) {
     let upstream = Upstream::serve(vec![Answer::Raw(response)]);
     assert_eq!(
-        fetched(&target(&upstream.url()), POLICY, Start::Fresh).await,
+        fetched(&upstream.url(), POLICY, Start::Fresh).await,
         Ok(Fetched {
             body: b"{}".to_vec(),
             etag: etag.map(str::to_owned),
@@ -166,12 +165,12 @@ async fn a_200_returns_the_body_and_its_etags(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fetch_runs_as_a_task_on_a_multi_thread_runtime() {
     let upstream = Upstream::serve(vec![Answer::Raw(OK)]);
-    let target = target(&upstream.url());
+    let url = upstream.url();
     let fetched = tokio::spawn(async move {
         fetch(
             &Client::for_test(),
-            &NoCredentials,
-            &target,
+            &S3Access::Environment { region: None },
+            &url,
             POLICY,
             Start::Fresh,
         )
@@ -192,7 +191,7 @@ async fn a_redirect_is_not_followed_and_its_body_is_the_document() {
         Answer::Raw(OK),
     ]);
     assert_eq!(
-        fetched(&target(&upstream.url()), POLICY, Start::Fresh).await,
+        fetched(&upstream.url(), POLICY, Start::Fresh).await,
         Ok(Fetched {
             body: b"{\"a\":1}".to_vec(),
             etag: None,
@@ -205,11 +204,7 @@ async fn a_redirect_is_not_followed_and_its_body_is_the_document() {
 #[tokio::test]
 async fn a_retryable_status_is_retried_until_it_succeeds() {
     let upstream = Upstream::serve(vec![Answer::Raw(UNAVAILABLE), Answer::Raw(OK)]);
-    assert!(
-        fetched(&target(&upstream.url()), POLICY, Start::Fresh)
-            .await
-            .is_ok()
-    );
+    assert!(fetched(&upstream.url(), POLICY, Start::Fresh).await.is_ok());
     assert_eq!(upstream.heads().len(), 2);
 }
 
@@ -224,7 +219,7 @@ async fn a_retry_after_shorter_than_the_backoff_is_honored() {
     };
     let fetched = tokio::time::timeout(
         Duration::from_secs(2),
-        fetched(&target(&upstream.url()), policy, Start::Fresh),
+        fetched(&upstream.url(), policy, Start::Fresh),
     )
     .await
     .expect("Retry-After: 0 replaces the 10s backoff");
@@ -238,7 +233,7 @@ async fn retryable_failures_stop_at_the_attempt_limit() {
     let upstream = Upstream::serve(vec![Answer::Raw(UNAVAILABLE)]);
     let url = upstream.url();
     assert_eq!(
-        fetched(&target(&url), POLICY, Start::Fresh).await,
+        fetched(&url, POLICY, Start::Fresh).await,
         Err(Failed {
             reason: format!("HTTP 503 from {url} (after 3 attempts)"),
             retryable: true,
@@ -254,7 +249,7 @@ async fn a_404_fails_on_the_first_attempt() {
     let upstream = Upstream::serve(vec![Answer::Raw(NOT_FOUND)]);
     let url = upstream.url();
     assert_eq!(
-        fetched(&target(&url), POLICY, Start::Fresh).await,
+        fetched(&url, POLICY, Start::Fresh).await,
         Err(Failed {
             reason: format!("HTTP 404 from {url}"),
             retryable: false,
@@ -274,9 +269,7 @@ async fn a_stalled_response_times_out_and_is_retried() {
         timeout: Duration::from_millis(100),
         ..POLICY
     };
-    let failed = fetched(&target(&url), policy, Start::Fresh)
-        .await
-        .unwrap_err();
+    let failed = fetched(&url, policy, Start::Fresh).await.unwrap_err();
     assert!(
         failed
             .reason
@@ -299,7 +292,7 @@ async fn a_resumed_fetch_makes_only_the_attempts_left() {
         retryable: true,
         retry_after: Some(Duration::ZERO),
     };
-    let failed = fetched(&target(&url), POLICY, Start::After(first))
+    let failed = fetched(&url, POLICY, Start::After(first))
         .await
         .unwrap_err();
     assert_eq!(
@@ -323,12 +316,7 @@ async fn a_resumed_fetch_with_no_attempts_left_returns_the_failure_it_resumed() 
         ..POLICY
     };
     assert_eq!(
-        fetched(
-            &target(&upstream.url()),
-            policy,
-            Start::After(first.clone())
-        )
-        .await,
+        fetched(&upstream.url(), policy, Start::After(first.clone())).await,
         Err(first)
     );
     assert!(upstream.heads().is_empty());
@@ -339,16 +327,9 @@ async fn a_resumed_fetch_with_no_attempts_left_returns_the_failure_it_resumed() 
 async fn a_failure_reason_drops_url_credentials() {
     let upstream = Upstream::serve(vec![Answer::Raw(NOT_FOUND)]);
     let address = upstream.base.trim_start_matches("http://");
-    let target = target(&format!(
-        "http://user:hunter2@{address}/cost.json?X-Amz-Signature=sig-secret#frag"
-    ));
-    let failed = fetched(&target, POLICY, Start::Fresh).await.unwrap_err();
+    let url = format!("http://user:hunter2@{address}/cost.json?X-Amz-Signature=sig-secret#frag");
+    let failed = fetched(&url, POLICY, Start::Fresh).await.unwrap_err();
     assert_eq!(failed.reason, format!("HTTP 404 from {}", upstream.url()));
-    let debug = format!("{target:?}");
-    for secret in ["user", "hunter2", "sig-secret", "frag"] {
-        assert!(!debug.contains(secret), "{debug}");
-    }
-    assert!(debug.contains(&upstream.url()), "{debug}");
 }
 
 #[rstest]
@@ -357,9 +338,7 @@ async fn a_failure_reason_drops_url_credentials() {
 #[case::s3_without_a_key("s3://prices")]
 #[tokio::test]
 async fn an_unfetchable_url_fails_without_a_request(#[case] url: &str) {
-    let failed = fetched(&target(url), POLICY, Start::Fresh)
-        .await
-        .unwrap_err();
+    let failed = fetched(url, POLICY, Start::Fresh).await.unwrap_err();
     assert!(
         failed
             .reason
@@ -370,21 +349,27 @@ async fn an_unfetchable_url_fails_without_a_request(#[case] url: &str) {
     assert!(!failed.retryable);
 }
 
-fn s3_target(url: &str, upstream: &Upstream) -> Target {
-    Target {
-        aws_endpoint_url: Some(upstream.base.clone()),
-        ..target(url)
-    }
+fn s3(upstream: &Upstream, credentials: impl ProvideCredentials + 'static) -> S3Access {
+    S3Access::Config(Box::new(
+        litellm_s3::config(
+            "us-west-2".into(),
+            Some(&upstream.base),
+            Client::for_test(),
+            credentials,
+        )
+        .build(),
+    ))
 }
 
 async fn fetched_from_s3(
-    target: &Target,
-    credentials: &(impl ProvideCredentials + Clone + 'static),
+    url: &str,
+    upstream: &Upstream,
+    credentials: impl ProvideCredentials + 'static,
 ) -> Result<Fetched, Failed> {
     fetch(
         &Client::for_test(),
-        credentials,
-        target,
+        &s3(upstream, credentials),
+        url,
         POLICY,
         Start::Fresh,
     )
@@ -396,7 +381,7 @@ async fn fetched_from_s3(
 async fn an_s3_fetch_sends_a_signed_get_object_to_the_endpoint() {
     let upstream = Upstream::serve(vec![Answer::Raw(OK)]);
     assert_eq!(
-        fetched_from_s3(&s3_target("s3://prices/maps/cost.json", &upstream), &keys()).await,
+        fetched_from_s3("s3://prices/maps/cost.json", &upstream, keys()).await,
         Ok(Fetched {
             body: b"{}".to_vec(),
             etag: Some("\"v1\"".into()),
@@ -428,8 +413,8 @@ async fn an_s3_body_that_stalls_after_the_headers_times_out() {
         Duration::from_secs(2),
         fetch(
             &Client::for_test(),
-            &keys(),
-            &s3_target(url, &upstream),
+            &s3(&upstream, keys()),
+            url,
             policy,
             Start::Fresh,
         ),
@@ -455,9 +440,7 @@ async fn an_s3_body_that_stalls_after_the_headers_times_out() {
 async fn an_s3_error_fails_without_a_retry(#[case] response: &'static str) {
     let upstream = Upstream::serve(vec![Answer::Raw(response), Answer::Raw(OK)]);
     let url = "s3://prices/cost.json";
-    let failed = fetched_from_s3(&s3_target(url, &upstream), &keys())
-        .await
-        .unwrap_err();
+    let failed = fetched_from_s3(url, &upstream, keys()).await.unwrap_err();
     assert!(
         failed
             .reason
@@ -474,7 +457,7 @@ async fn an_s3_error_fails_without_a_retry(#[case] response: &'static str) {
 async fn an_s3_fetch_without_credentials_fails_without_a_request() {
     let upstream = Upstream::serve(vec![Answer::Raw(OK)]);
     let url = "s3://prices/cost.json";
-    let failed = fetched_from_s3(&s3_target(url, &upstream), &NoCredentials)
+    let failed = fetched_from_s3(url, &upstream, NoCredentials)
         .await
         .unwrap_err();
     assert!(
@@ -500,8 +483,8 @@ const DECLARED_OVERSIZED: &str =
 async fn a_body_over_100_mib_fails_without_a_retry(#[case] answer: Answer, #[case] s3: bool) {
     let upstream = Upstream::serve(vec![answer, Answer::Raw(OK)]);
     let failed = match s3 {
-        true => fetched_from_s3(&s3_target("s3://prices/cost.json", &upstream), &keys()).await,
-        false => fetched(&target(&upstream.url()), POLICY, Start::Fresh).await,
+        true => fetched_from_s3("s3://prices/cost.json", &upstream, keys()).await,
+        false => fetched(&upstream.url(), POLICY, Start::Fresh).await,
     }
     .unwrap_err();
     assert!(
@@ -525,7 +508,7 @@ async fn a_body_of_exactly_100_mib_is_fetched() {
         )
         .into_boxed_str(),
     ))]);
-    let fetched = fetched(&target(&upstream.url()), POLICY, Start::Fresh)
+    let fetched = fetched(&upstream.url(), POLICY, Start::Fresh)
         .await
         .unwrap();
     assert_eq!(fetched.body.len(), 100 * 1024 * 1024);
